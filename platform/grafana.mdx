@@ -1,0 +1,149 @@
+---
+title: "Grafana"
+description: "Pre-configured Grafana dashboards with traces, metrics, and logs correlation"
+---
+
+Grafana OSS 10.4.2 is pre-provisioned with datasources and dashboards covering the full observability stack — metrics from Prometheus, distributed traces from Tempo, and structured logs from Loki. All three signals are cross-linked so you can jump from a slow HTTP request to its trace, then from the trace to the related log lines.
+
+Grafana is available at **[http://localhost:3000](http://localhost:3000)**.
+
+| Credential | Value |
+|------------|-------|
+| Username | `user` |
+| Password | `password` |
+
+Anonymous viewer access is also enabled (`GF_AUTH_ANONYMOUS_ENABLED=true`), so dashboards can be opened without logging in.
+
+<Note>
+Grafana uses the `postgres` service defined in `compose.yml` as its own backing database — this stores dashboard configs, alert rules, and user sessions. It is separate from any application database used by `instrument-service` or other Spring Boot apps.
+</Note>
+
+## Datasources
+
+Datasources are provisioned automatically from `platform/grafana/datasources/datasources.yml`. All three are pre-wired with cross-datasource links.
+
+### Prometheus
+
+Scrapes metrics written by Alloy via remote write. Configured with exemplar support so individual metric data points can link directly to a trace in Tempo.
+
+```yaml
+- name: Prometheus
+  type: prometheus
+  uid: prometheus
+  url: http://prometheus:9090
+  jsonData:
+    httpMethod: POST
+    exemplarTraceIdDestinations:
+      - name: traceID
+        datasourceUid: tempo
+```
+
+### Tempo
+
+Receives traces from Spring Boot apps via Alloy. Configured with two navigation shortcuts:
+
+- **Trace to metrics** — from a span, jump to Prometheus to see throughput and latency for that service/operation using span attribute tags (`service.name`, `org`, `method`, `uri`, `outcome`, `status`, `exception`).
+- **Trace to logs** — from a span, jump to Loki to find log lines that overlap in time, filtered by `org` and `service.name` labels.
+
+Node graph visualization is enabled, showing service dependency topology derived from spans.
+
+```yaml
+- name: Tempo
+  type: tempo
+  uid: tempo
+  url: http://tempo:3100
+  jsonData:
+    tracesToMetrics:
+      datasourceUid: prometheus
+      tags:
+        - { key: 'service.name', value: 'application' }
+        - { key: 'org' }
+        - { key: 'method' }
+        - { key: 'uri' }
+        - { key: 'outcome' }
+        - { key: 'status' }
+        - { key: 'exception' }
+      queries:
+        - name: 'Throughput'
+          query: 'sum(rate(http_server_requests_seconds_count{$$__tags}[$$__rate_interval]))'
+        - name: 'Latency'
+          query: 'histogram_quantile(1.00, sum(rate(http_server_requests_seconds_bucket{$$__tags}[$$__rate_interval])) by (le))'
+    tracesToLogs:
+      datasourceUid: loki
+      tags: ['instance', 'pod', 'namespace', 'hostname']
+      mappedTags:
+        - { key: 'org' }
+        - { key: 'service.name', value: 'application' }
+      mapTagNamesEnabled: true
+      filterByTraceID: true
+    nodeGraph:
+      enabled: true
+```
+
+### Loki
+
+Receives logs from all Docker containers via Alloy's Docker log discovery. Set as the **default** datasource. Configured with a derived field that extracts a trace ID from Spring Boot's log pattern and links it back to Tempo:
+
+```yaml
+- name: Loki
+  type: loki
+  uid: loki
+  url: http://loki:3100
+  isDefault: true
+  jsonData:
+    derivedFields:
+      - datasourceUid: tempo
+        matcherRegex: '.+ --- \[.+\] \[.+\] \[(\w*)-\w*\] .+'
+        name: traceId
+        url: ${__value.raw}
+```
+
+The regex matches Spring Boot's correlation log pattern `[traceId-spanId]` and extracts the trace ID. Clicking the extracted value opens the corresponding trace in Tempo.
+
+## Pre-built dashboards
+
+Dashboards are loaded from `platform/grafana/dashboards/` using Grafana's file provisioning. The `foldersFromFilesStructure: true` setting means the `applications/` and `platform/` subdirectories become Grafana folders automatically.
+
+### Applications folder
+
+| File | Dashboard | Purpose |
+|------|-----------|---------|
+| `jvm.json` | JVM Micrometer | Heap usage, GC pause times, thread counts, classloader stats |
+| `polar-http.json` | Spring Boot HTTP (polar) | HTTP request rate, error rate, and latency percentiles per endpoint |
+| `spring-boot.json` | Spring Boot Overview | High-level service health and request throughput |
+| `spring-boot-jdbc.json` | Spring Boot JDBC | JDBC connection pool utilization and database query timing |
+
+### Platform folder
+
+| File | Dashboard | Purpose |
+|------|-----------|---------|
+| `prometheus-stats.json` | Prometheus Stats | Prometheus self-monitoring — scrape durations, WAL size, rule evaluations |
+
+## Navigating traces, metrics, and logs
+
+### From a metric exemplar to a trace
+
+Exemplars are sparse samples embedded in metric time series that carry a trace ID. In Grafana:
+
+1. Open a Prometheus panel (e.g., `http_server_requests_seconds` histogram).
+2. Enable **Exemplars** in the panel query options.
+3. Click a diamond-shaped exemplar point on the graph.
+4. Select **Query with Tempo** to jump directly to that trace.
+
+### From a trace to logs
+
+1. Open the **Explore** view and select the **Tempo** datasource.
+2. Search for a trace by service name or trace ID.
+3. Click any span in the trace waterfall.
+4. The **Logs** button in the span detail panel opens a pre-filtered Loki query matching the time window and `org`/`service.name` labels from that span.
+
+### From a log line to a trace
+
+1. Open the **Explore** view and select **Loki**.
+2. Run a log query (e.g., `{application="edge-service"}`).
+3. Log lines from Spring Boot will show a **traceId** link in the derived fields column.
+4. Click the link to open the trace in Tempo.
+
+## Grafana Alloy admin interface
+
+Alloy's admin UI at **[http://localhost:12345](http://localhost:12345)** shows the health of each pipeline component: OTLP receivers, Prometheus scrapers, Loki writers, and the remote write WAL. Use this to diagnose missing metrics or dropped spans.

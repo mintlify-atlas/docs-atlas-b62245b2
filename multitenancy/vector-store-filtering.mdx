@@ -1,0 +1,148 @@
+---
+title: "Tenant-Isolated Vector Store"
+description: "How chat-service tags documents with a tenant metadata field at ingestion time and filters by that field at query time to prevent cross-tenant document retrieval."
+---
+
+The `chat-service` uses a ChromaDB vector store for retrieval-augmented generation (RAG). Without filtering, a similarity search would return the most semantically similar document chunks from the entire vector store — regardless of which tenant they belong to. A `dukes` user could receive content from `beans` documents.
+
+The solution is to tag every document chunk with a `tenant` metadata field at ingestion time, then add a filter expression to every similarity search at query time.
+
+## Document ingestion: `DocumentInitializer`
+
+`DocumentInitializer` runs at application startup via `@PostConstruct`. It reads two story documents from the classpath, tags each with its owner tenant, chunks the text, and stores the resulting vectors:
+
+```java DocumentInitializer.java
+@Component
+public class DocumentInitializer {
+
+    private static final Logger log =
+            LoggerFactory.getLogger(DocumentInitializer.class);
+    private final VectorStore vectorStore;
+
+    @Value("classpath:documents/story1.md")
+    Resource textFile1;
+
+    @Value("classpath:documents/story2.txt")
+    Resource textFile2;
+
+    public DocumentInitializer(VectorStore vectorStore) {
+        this.vectorStore = vectorStore;
+    }
+
+    @PostConstruct
+    public void run() {
+        List<Document> documents = new ArrayList<>();
+
+        log.info("Loading .md files as Documents (dukes)");
+        var textReader1 = new TextReader(textFile1);
+        textReader1.getCustomMetadata().put("tenant", "dukes");  // tag with tenant
+        textReader1.setCharset(Charset.defaultCharset());
+        documents.addAll(textReader1.get());
+
+        log.info("Loading .txt files as Documents (beans)");
+        var textReader2 = new TextReader(textFile2);
+        textReader2.getCustomMetadata().put("tenant", "beans");  // tag with tenant
+        textReader2.setCharset(Charset.defaultCharset());
+        documents.addAll(textReader2.get());
+
+        log.info("Splitting text into chunks");
+        var tokenizedDocuments = new TokenTextSplitter().apply(documents);
+
+        log.info("Creating and storing Embeddings from Documents");
+        vectorStore.add(tokenizedDocuments);
+    }
+
+}
+```
+
+The metadata key `"tenant"` is set on each `TextReader`'s custom metadata map before calling `.get()`. Spring AI propagates this metadata to every `Document` chunk produced by the reader, so after `TokenTextSplitter` splits the text into smaller pieces, every chunk retains its `tenant` tag.
+
+### Sample documents
+
+| File | Tenant | Content |
+|------|--------|---------|
+| `documents/story1.md` | `dukes` | The story of The Dukes, a rock band from Seattle |
+| `documents/story2.txt` | `beans` | The story of The Beans, a band from New York City |
+
+## Tenant-filtered similarity search: `DocumentChatService`
+
+`DocumentChatService` implements the RAG pipeline. It reads the current tenant from `TenantContextHolder`, constructs a filter expression, and passes it to the vector store search:
+
+```java DocumentChatService.java
+@Service
+class DocumentChatService {
+
+    private final ChatClient chatClient;
+    private final VectorStore vectorStore;
+
+    DocumentChatService(ChatClient chatClient, VectorStore vectorStore) {
+        this.chatClient = chatClient;
+        this.vectorStore = vectorStore;
+    }
+
+    AssistantMessage chatWithDocument(String message) {
+        var systemPromptTemplate = new SystemPromptTemplate("""
+                You're assisting with questions about rock bands, their story,
+                their members, and their music.
+
+                Use the information from the DOCUMENTS section to provide accurate
+                answers and assume no prior knowledge, but act as if you knew this
+                information innately. If unsure, simply state that you don't know.
+
+                DOCUMENTS:
+                {documents}
+                """);
+
+        List<Document> similarDocuments = vectorStore.similaritySearch(
+                SearchRequest
+                        .query(message)
+                        .withFilterExpression(
+                            "tenant == '%s'".formatted(
+                                TenantContextHolder.getRequiredTenantIdentifier())) // (1)
+                        .withTopK(3));                                               // (2)
+
+        String documents = similarDocuments.stream()
+                .map(Document::getContent)
+                .collect(Collectors.joining(System.lineSeparator()));
+
+        Map<String, Object> model = Map.of("documents", documents);
+        var systemMessage = systemPromptTemplate.createMessage(model);  // (3)
+
+        var userMessage = new UserMessage(message);
+        var prompt = new Prompt(List.of(systemMessage, userMessage));
+
+        var chatResponse = chatClient.call(prompt);                      // (4)
+        return chatResponse.getResult().getOutput();
+    }
+
+}
+```
+
+### RAG pipeline steps
+
+<Steps>
+  <Step title="Filter expression">
+    `TenantContextHolder.getRequiredTenantIdentifier()` returns the tenant set by `TenantContextFilter`. The filter expression `tenant == 'dukes'` (or `beans`) is sent to ChromaDB as a metadata filter, restricting results to chunks that carry that exact `tenant` value.
+  </Step>
+  <Step title="Similarity search">
+    ChromaDB performs vector similarity search across only the filtered subset. `withTopK(3)` limits the result to the three most relevant document chunks.
+  </Step>
+  <Step title="Prompt construction">
+    The retrieved chunks are joined into a single string and injected into the `SystemPromptTemplate` under the `{documents}` variable. The LLM is instructed to answer based solely on the provided documents.
+  </Step>
+  <Step title="LLM call">
+    The assembled `Prompt` (system message with documents + user message) is sent to the Ollama `llama2` model. The response is returned as an `AssistantMessage`.
+  </Step>
+</Steps>
+
+## Why filtering is required
+
+Without the `withFilterExpression(...)` call, ChromaDB would search across all stored chunks and return the top-K results globally. Because vector similarity is semantic rather than exact, a question about band members could match chunks from either tenant's story. The tenant filter confines every search to the requesting tenant's data partition.
+
+<Note>
+  The metadata field name is `tenant` (lowercase). This is a string stored in ChromaDB's document metadata alongside the embedding vector. The filter syntax `tenant == 'dukes'` is ChromaDB's where-clause syntax, translated by Spring AI's ChromaDB vector store integration. If you change the metadata key name at ingestion time, update the filter expression in `DocumentChatService` to match.
+</Note>
+
+<Tip>
+  In production, enrich the document metadata with additional fields — such as `category`, `version`, or `language` — to support more granular filtering. Spring AI's `SearchRequest.withFilterExpression` accepts compound expressions (e.g. `tenant == 'dukes' && category == 'biography'`), so the same pattern extends naturally to multi-dimensional filtering without changes to the retrieval architecture.
+</Tip>

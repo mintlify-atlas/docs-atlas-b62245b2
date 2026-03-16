@@ -1,0 +1,205 @@
+---
+title: "Schema-per-Tenant Database Isolation"
+description: "How instrument-service assigns each tenant its own PostgreSQL schema, runs per-tenant Flyway migrations, and switches schemas at the JDBC connection level using Hibernate multitenancy."
+---
+
+The `instrument-service` stores data for each tenant in a dedicated PostgreSQL schema (`DUKES`, `BEANS`, etc.) rather than mixing rows from different tenants in shared tables. This provides strong data isolation at the database level: a misconfigured query or ORM bug cannot accidentally expose one tenant's rows to another.
+
+## Architecture overview
+
+Three components collaborate to implement schema-per-tenant isolation:
+
+| Component | Role |
+|-----------|------|
+| `TenantIdentifierResolver` | Tells Hibernate which tenant is active for the current thread |
+| `ConnectionProvider` | Switches the JDBC connection's schema when Hibernate requests a connection |
+| `TenantFlywayMigrationInitializer` | Runs tenant-specific Flyway migrations into each schema at startup |
+
+## `TenantIdentifierResolver`
+
+`TenantIdentifierResolver` implements Hibernate's `CurrentTenantIdentifierResolver<String>`. It reads from `TenantContextHolder` and falls back to the sentinel value `"DEFAULT"` when no tenant is set (during application context initialisation, health checks, etc.):
+
+```java TenantIdentifierResolver.java
+@Component
+public class TenantIdentifierResolver
+        implements CurrentTenantIdentifierResolver<String>, HibernatePropertiesCustomizer {
+
+    public static final String DEFAULT_TENANT = "DEFAULT";
+
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        return Objects.requireNonNullElse(
+            TenantContextHolder.getTenantIdentifier(), DEFAULT_TENANT);
+    }
+
+    @Override
+    public boolean validateExistingCurrentSessions() {
+        return true;
+    }
+
+    @Override
+    public void customize(Map<String, Object> hibernateProperties) {
+        hibernateProperties.put(
+            AvailableSettings.MULTI_TENANT_IDENTIFIER_RESOLVER, this);
+    }
+
+}
+```
+
+The class also implements `HibernatePropertiesCustomizer`, so Spring Boot picks it up automatically and registers it as Hibernate's `MULTI_TENANT_IDENTIFIER_RESOLVER` without any explicit `@Bean` wiring.
+
+## `ConnectionProvider`
+
+`ConnectionProvider` implements Hibernate's `MultiTenantConnectionProvider<String>`. When Hibernate requests a connection for a specific tenant, the provider obtains a raw JDBC connection from the `DataSource` and calls `connection.setSchema(schema)` to switch to the correct PostgreSQL schema:
+
+```java ConnectionProvider.java
+@Component
+public class ConnectionProvider
+        implements MultiTenantConnectionProvider<String>, HibernatePropertiesCustomizer {
+
+    private final DataSource dataSource;
+    private final TenantDetailsService tenantDetailsService;
+
+    ConnectionProvider(DataSource dataSource, TenantDetailsService tenantDetailsService) {
+        this.dataSource = dataSource;
+        this.tenantDetailsService = tenantDetailsService;
+    }
+
+    @Override
+    public Connection getAnyConnection() throws SQLException {
+        return getConnection("DEFAULT");
+    }
+
+    @Override
+    public void releaseAnyConnection(Connection connection) throws SQLException {
+        connection.close();
+    }
+
+    @Override
+    public Connection getConnection(String tenantIdentifier) throws SQLException {
+        var tenantDetails = tenantDetailsService.loadTenantByIdentifier(tenantIdentifier);
+        var schema = tenantDetails != null ? tenantDetails.schema() : tenantIdentifier;
+
+        Connection connection = dataSource.getConnection();
+        connection.setSchema(schema);   // switch to tenant schema
+        return connection;
+    }
+
+    @Override
+    public void releaseConnection(String tenantIdentifier, Connection connection)
+            throws SQLException {
+        connection.setSchema("DEFAULT"); // reset before returning to pool
+        connection.close();
+    }
+
+    @Override
+    public boolean supportsAggressiveRelease() {
+        return true;
+    }
+
+    @Override
+    public void customize(Map<String, Object> hibernateProperties) {
+        hibernateProperties.put(
+            AvailableSettings.MULTI_TENANT_CONNECTION_PROVIDER, this);
+    }
+
+}
+```
+
+The mapping from logical tenant identifier (e.g. `dukes`) to physical schema name (e.g. `DUKES`) is resolved via `TenantDetailsService`. If the tenant is not found in the registry, the identifier itself is used as a fallback schema name. On `releaseConnection`, the schema is reset to `"DEFAULT"` before the connection is returned to the pool.
+
+## `TenantFlywayMigrationInitializer`
+
+At application startup, `TenantFlywayMigrationInitializer` runs after the default schema migration and applies the tenant-specific migration scripts to every registered tenant schema:
+
+```java TenantFlywayMigrationInitializer.java
+@Component
+public class TenantFlywayMigrationInitializer implements InitializingBean, Ordered {
+
+    private static final String TENANT_MIGRATION_LOCATION = "db/migration/tenant";
+
+    private final DataSource dataSource;
+    private final Flyway defaultFlyway;
+    private final TenantDetailsService tenantDetailsService;
+
+    public TenantFlywayMigrationInitializer(DataSource dataSource,
+                                             Flyway defaultFlyway,
+                                             TenantDetailsService tenantDetailsService) {
+        this.dataSource = dataSource;
+        this.defaultFlyway = defaultFlyway;
+        this.tenantDetailsService = tenantDetailsService;
+    }
+
+    @Override
+    public void afterPropertiesSet() {
+        tenantDetailsService.loadAllTenants().forEach(tenant -> {
+            Flyway flyway = tenantFlyway(tenant.schema());
+            flyway.migrate();
+        });
+    }
+
+    private Flyway tenantFlyway(String schema) {
+        return Flyway.configure()
+                .configuration(defaultFlyway.getConfiguration())
+                .locations(TENANT_MIGRATION_LOCATION)
+                .dataSource(dataSource)
+                .schemas(schema)
+                .load();
+    }
+
+    @Override
+    public int getOrder() {
+        // Executed after the default schema initialisation in FlywayMigrationInitializer.
+        return 1;
+    }
+
+}
+```
+
+The `getOrder()` value of `1` ensures this runs after Spring Boot's own `FlywayMigrationInitializer` (which has the lowest order), so the shared `default` schema is ready before any tenant schema is migrated.
+
+## Migration scripts
+
+Default schema migrations live in `db/migration/default` and create shared infrastructure. Tenant-specific migrations live in `db/migration/tenant`:
+
+```sql db/migration/tenant/V1__Instrument_table.sql
+CREATE TABLE instrument(
+   id      UUID PRIMARY KEY,
+   name    VARCHAR(255) NOT NULL,
+   type    VARCHAR(255)
+);
+```
+
+This script runs once per tenant schema. After startup, the `DUKES` and `BEANS` schemas each contain an independent `instrument` table — queries from the `dukes` context never touch `BEANS.instrument`.
+
+## Flyway configuration
+
+The default Flyway configuration targets the `default` schema, which is intentionally separate from all tenant schemas:
+
+```yaml application.yml
+spring:
+  flyway:
+    locations: classpath:db/migration/default
+    schemas: default
+```
+
+<Tip>
+  In production, consider a dedicated connection pool per tenant rather than schema-switching on a shared pool. `setSchema` is inexpensive for most JDBC drivers, but connection pools that validate connections on acquisition (e.g. with `validationQuery`) may issue extra round-trips on every schema switch. A per-tenant pool eliminates this overhead and allows independent pool sizing and monitoring per tenant.
+</Tip>
+
+## Schema isolation vs row-level isolation
+
+<AccordionGroup>
+  <Accordion title="Schema-per-tenant advantages">
+    - Queries and indexes are completely separate; one tenant's table growth does not degrade another's.
+    - DDL changes (adding columns, new indexes) can be applied per-tenant without affecting others.
+    - PostgreSQL's `search_path` mechanism enforces isolation at the database engine level — an ORM misconfiguration is far less likely to cross schema boundaries.
+    - Simpler backup and restore per tenant.
+  </Accordion>
+  <Accordion title="Row-level isolation trade-offs">
+    - All tenants share the same tables and indexes, so a large tenant can slow queries for everyone.
+    - Every query must include a `WHERE tenant_id = ?` predicate; missing one leaks data.
+    - Requires either application-enforced discipline or PostgreSQL Row-Level Security policies.
+    - Simpler schema evolution — one migration applies to all tenants simultaneously.
+  </Accordion>
+</AccordionGroup>

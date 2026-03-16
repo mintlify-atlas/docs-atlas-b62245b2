@@ -1,80 +1,173 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Run the full Spring Boot Multitenancy stack locally in minutes and explore tenant-isolated data."
 ---
 
-## Get started in three steps
+<Steps>
+  <Step title="Prerequisites">
+    Ensure you have the following installed:
 
-Get your documentation site running locally and make your first customization.
+    - **Java 21** — required for all three Spring Boot services
+    - **Docker** — for running backing services via Docker Compose
+    - **Ollama** (optional) — only needed if running chat-service without Testcontainers
 
-### Step 1: Set up your local environment
+    ```bash
+    java -version   # should show 21+
+    docker --version
+    ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    <Tip>
+      If you don't want to install Ollama, you can run chat-service with `./gradlew bootTestRun` instead — it automatically spins up an Ollama container via Testcontainers.
+    </Tip>
+  </Step>
 
-### Step 2: Deploy your changes
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/ThomasVitale/spring-boot-multitenancy.git
+    cd spring-boot-multitenancy
+    ```
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Start backing services">
+    From the project root, start all backing services (Keycloak, ChromaDB, Grafana, Loki, Prometheus, Tempo, Grafana Alloy):
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    docker-compose up -d
+    ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    This starts:
 
-### Step 3: Go live
+    | Service | URL | Purpose |
+    |---------|-----|---------|
+    | Keycloak | http://localhost:8080 | OAuth2/OIDC identity provider |
+    | ChromaDB | http://localhost:8000 | Vector store for AI chat |
+    | Grafana | http://localhost:3000 | Dashboards (user/password) |
+    | Loki | http://localhost:3100 | Log aggregation |
+    | Grafana Alloy | http://localhost:12345 | OTLP collector admin |
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    <Note>
+      PostgreSQL for instrument-service and Ollama for chat-service are managed separately. When you run these services with `bootTestRun`, Testcontainers automatically provisions the required containers.
+    </Note>
+  </Step>
 
-## Next steps
+  <Step title="Configure DNS for tenant subdomains">
+    The edge service uses subdomain-based routing. Add these entries to your `/etc/hosts` file (requires `sudo`):
 
-Now that you have your docs running, explore these key features:
+    ```bash
+    127.0.0.1       dukes.rock
+    127.0.0.1       beans.rock
+    ```
+
+    <Warning>
+      Without these entries, your browser cannot resolve `dukes.rock` or `beans.rock`, and the edge service routing will not work.
+    </Warning>
+  </Step>
+
+  <Step title="Run instrument-service">
+    Open a terminal in the `instrument-service/` directory and run:
+
+    ```bash
+    cd instrument-service
+    ./gradlew bootTestRun
+    ```
+
+    This starts instrument-service on port **8181** and uses Testcontainers to automatically provision a PostgreSQL 16 database. The service will:
+    - Run Flyway migrations on the `default` schema
+    - Run per-tenant Flyway migrations on the `DUKES` and `BEANS` schemas
+    - Seed demo instrument data for both tenants
+
+    <Note>
+      The first run may take longer as Docker pulls the PostgreSQL container image.
+    </Note>
+  </Step>
+
+  <Step title="Run edge-service">
+    Open a second terminal in the `edge-service/` directory:
+
+    ```bash
+    cd edge-service
+    ./gradlew bootRun
+    ```
+
+    This starts the API gateway on port **80**. It handles:
+    - Subdomain routing (`dukes.rock` and `beans.rock`)
+    - Per-tenant OAuth2 login via Keycloak
+    - JWT token relay to downstream services
+  </Step>
+
+  <Step title="Run chat-service">
+    Open a third terminal in the `chat-service/` directory:
+
+    <Tabs>
+      <Tab title="With Testcontainers (recommended)">
+        ```bash
+        cd chat-service
+        ./gradlew bootTestRun
+        ```
+
+        Testcontainers automatically starts an Ollama container with the `llama2` model pre-loaded and a ChromaDB container. The service loads tenant documents into ChromaDB on startup.
+      </Tab>
+      <Tab title="With local Ollama">
+        First, install [Ollama](https://ollama.ai/) and pull the llama2 model:
+
+        ```bash
+        ollama run llama2
+        ```
+
+        Then start the service (ChromaDB is already running via Docker Compose):
+
+        ```bash
+        cd chat-service
+        ./gradlew bootRun
+        ```
+      </Tab>
+    </Tabs>
+
+    Chat-service runs on port **8282**.
+  </Step>
+
+  <Step title="Explore tenant isolation">
+    With all three services running, test the tenant isolation:
+
+    **Dukes tenant:**
+
+    Open your browser and navigate to `http://dukes.rock/instruments/`
+
+    You'll be redirected to the Keycloak login page for the `dukes` realm. Log in with:
+    - Username: `isabelle`
+    - Password: `password`
+
+    You'll see the list of instruments from the Dukes rock band — data from the `DUKES` PostgreSQL schema.
+
+    **Beans tenant:**
+
+    Open a second browser window (or incognito) and navigate to `http://beans.rock/instruments/`
+
+    Log in with:
+    - Username: `bjorn`
+    - Password: `password`
+
+    You'll see the instruments from the Beans rock band — data from the `BEANS` PostgreSQL schema, completely isolated from the Dukes tenant.
+
+    <Tip>
+      Notice that `isabelle` cannot log into `beans.rock` and vice versa — each user belongs to a different Keycloak realm, enforcing tenant isolation at the authentication layer.
+    </Tip>
+  </Step>
+</Steps>
+
+## What's next?
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    Understand how the three services work together.
+  </Card>
+  <Card title="Multitenancy patterns" icon="layers" href="/architecture/multitenancy-patterns">
+    Explore all the isolation techniques used in this project.
+  </Card>
+  <Card title="Edge Service" icon="shield-halved" href="/services/edge-service">
+    Deep-dive into subdomain routing and OAuth2 login.
+  </Card>
+  <Card title="Observability" icon="chart-line" href="/observability/overview">
+    Explore metrics, traces, and logs in Grafana.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

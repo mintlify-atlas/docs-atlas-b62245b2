@@ -1,0 +1,147 @@
+---
+title: "Tenant Context"
+description: "How the current tenant identifier is stored in a thread-local holder, propagated through the request lifecycle, and integrated with logs and distributed traces."
+---
+
+Once a request has been resolved to a specific tenant, that tenant's identity must be available to every component that handles the request — database sessions, cache key generators, security providers, and AI vector searches — without passing it as a method argument through every layer. `TenantContextHolder` provides this shared store.
+
+## `TenantContextHolder`
+
+`TenantContextHolder` is a final, non-instantiable utility class that wraps a `ThreadLocal<String>`:
+
+```java TenantContextHolder.java
+/**
+ * A shared, thread-local store for the current tenant.
+ */
+public final class TenantContextHolder {
+
+    private static final Logger log = LoggerFactory.getLogger(TenantContextHolder.class);
+
+    private static final ThreadLocal<String> tenantIdentifier = new ThreadLocal<>();
+
+    private TenantContextHolder() {}
+
+    public static void setTenantIdentifier(String tenant) {
+        Assert.hasText(tenant, "tenant cannot be empty");
+        log.trace("Setting current tenant to: {}", tenant);
+        tenantIdentifier.set(tenant);
+    }
+
+    @Nullable
+    public static String getTenantIdentifier() {
+        return tenantIdentifier.get();
+    }
+
+    public static String getRequiredTenantIdentifier() {
+        var tenant = getTenantIdentifier();
+        if (!StringUtils.hasText(tenant)) {
+            throw new TenantNotFoundException("No tenant found in the current context");
+        }
+        return tenant;
+    }
+
+    public static void clear() {
+        log.trace("Clearing current tenant");
+        tenantIdentifier.remove();
+    }
+
+}
+```
+
+The API provides three access patterns:
+
+| Method | Returns | Use when |
+|--------|---------|----------|
+| `getTenantIdentifier()` | `String \| null` | Tenant may legitimately be absent (e.g. Hibernate initialisation) |
+| `getRequiredTenantIdentifier()` | `String` | Tenant is required; throws `TenantNotFoundException` if absent |
+| `setTenantIdentifier(String)` | `void` | Called by `TenantContextFilter` at the start of each request |
+| `clear()` | `void` | Called in the `finally` block of `TenantContextFilter` |
+
+<Warning>
+  **ThreadLocal leaks.** If `clear()` is not called before the thread is returned to the pool, the tenant identifier from a previous request will be visible to the next request served by that thread. Always clear the holder in a `finally` block — never rely on normal control flow alone.
+</Warning>
+
+## ThreadLocal lifecycle in `TenantContextFilter`
+
+`TenantContextFilter` owns the full lifecycle of the `TenantContextHolder` value for each HTTP request:
+
+```java TenantContextFilter.java
+@Override
+protected void doFilterInternal(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain) throws ServletException, IOException {
+    var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+    if (StringUtils.hasText(tenantIdentifier) && isTenantValid(tenantIdentifier)) {
+        TenantContextHolder.setTenantIdentifier(tenantIdentifier);  // (1) set
+        configureLogs(tenantIdentifier);
+        configureTraces(tenantIdentifier, request);
+    } else {
+        throw new TenantResolutionException(
+            "A valid tenant must be specified for requests to %s"
+                .formatted(request.getRequestURI()));
+    }
+
+    try {
+        filterChain.doFilter(request, response);                      // (2) downstream runs
+    } finally {
+        clear();                                                       // (3) always cleared
+    }
+}
+
+private void clear() {
+    MDC.remove("tenantId");          // remove from structured logging
+    TenantContextHolder.clear();     // remove from ThreadLocal
+}
+```
+
+The three stages are:
+
+<Steps>
+  <Step title="Set">
+    After the tenant is resolved and validated, `TenantContextHolder.setTenantIdentifier` stores it in the current thread's `ThreadLocal`. MDC and observation context are populated in the same step.
+  </Step>
+  <Step title="Propagate">
+    The rest of the filter chain — including Spring Security's `BearerTokenAuthenticationFilter`, the dispatcher servlet, and all service/repository calls — executes with the tenant available via `TenantContextHolder.getTenantIdentifier()`.
+  </Step>
+  <Step title="Clear">
+    The `finally` block unconditionally calls `clear()`, which removes the value from both the MDC and the `ThreadLocal`. This runs even if the downstream handler throws an exception.
+  </Step>
+</Steps>
+
+## MDC integration
+
+After setting the tenant context, the filter adds the tenant identifier to SLF4J's Mapped Diagnostic Context:
+
+```java TenantContextFilter.java
+private void configureLogs(String tenantId) {
+    MDC.put("tenantId", tenantId);
+}
+```
+
+The `logback-spring.xml` log pattern in each service picks this up automatically:
+
+```yaml application.yml
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+```
+
+Every log line emitted during a request includes the tenant identifier alongside the trace and span IDs, making it straightforward to filter logs by tenant in any log aggregation system.
+
+## Micrometer observation integration
+
+The filter also attaches the tenant as a high-cardinality key–value pair on the current Micrometer `ObservationContext`:
+
+```java TenantContextFilter.java
+private void configureTraces(String tenantId, HttpServletRequest request) {
+    ServerHttpObservationFilter.findObservationContext(request).ifPresent(context ->
+        context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+}
+```
+
+This attaches `tenant.id` to the active span, so distributed traces exported to Zipkin, Jaeger, or an OpenTelemetry collector include the tenant dimension without any additional instrumentation.
+
+<Note>
+  The chat-service enables Java 21 virtual threads via `spring.threads.virtual.enabled: true`. With virtual threads each request runs on a fresh carrier thread (or a recycled one), but the `ThreadLocal` semantics are identical — `TenantContextHolder` is thread-local to the virtual thread, not the carrier thread. Spring Boot 3.2 handles this transparently, so the `finally`-block cleanup remains correct and sufficient.
+</Note>

@@ -1,0 +1,95 @@
+---
+title: "Architecture Overview"
+description: "A high-level look at the three-service Spring Boot multitenancy architecture: how edge-service, instrument-service, and chat-service collaborate to serve multiple isolated tenants."
+---
+
+This project demonstrates a practical multitenancy implementation built on Spring Boot 3.2 and Java 21. Three services work together to handle tenant identification, authentication, data isolation, and AI-powered chat — all with zero code changes needed to onboard or remove a tenant.
+
+## Services at a Glance
+
+| Service | Port | Technology | Responsibility |
+|---|---|---|---|
+| `edge-service` | 80 | Spring Cloud Gateway, Spring Security OAuth2 | Subdomain routing, per-tenant OAuth2 login, JWT token relay, `X-TenantId` header injection |
+| `instrument-service` | 8181 | Spring MVC, Spring Data JPA, Hibernate, PostgreSQL | REST API; resolves tenant from `X-TenantId`, validates JWT, switches PostgreSQL schema per tenant |
+| `chat-service` | 8282 | Spring MVC, Spring AI, ChromaDB, Ollama | RAG chat API; resolves tenant from `X-TenantId`, filters ChromaDB vector queries by tenant metadata |
+
+<CardGroup cols={2}>
+  <Card title="Edge Service" icon="shield-halved" href="/services/edge-service">
+    Spring Cloud Gateway with subdomain-based routing and per-tenant OAuth2/OIDC login via Keycloak.
+  </Card>
+  <Card title="Instrument Service" icon="database" href="/services/instrument-service">
+    REST API with schema-per-tenant PostgreSQL isolation, per-tenant JWT validation, and tenant-aware caching.
+  </Card>
+  <Card title="Chat Service" icon="message" href="/services/chat-service">
+    AI chat endpoint using RAG (Retrieval-Augmented Generation) with per-tenant ChromaDB vector store filtering.
+  </Card>
+</CardGroup>
+
+## How a Request Flows
+
+A browser navigates to `http://dukes.rock/instruments/`. The subdomain `dukes` is the entire source of tenant identity for that request. From that point, the tenant identifier travels through every layer of the system:
+
+1. **edge-service** extracts the subdomain, redirects unauthenticated users to the `dukes` Keycloak realm, and after login forwards the request downstream with two additions: an `X-TenantId: dukes` header and a `Bearer` JWT token.
+2. **instrument-service** reads `X-TenantId` from the incoming header, validates the JWT against the `dukes` realm's OIDC issuer, stores the tenant identifier in a `ThreadLocal` (`TenantContextHolder`), and tells Hibernate to connect to the `DUKES` PostgreSQL schema for the duration of the request.
+3. **chat-service** follows the same `X-TenantId` pattern and uses the tenant identifier to filter ChromaDB vector similarity searches so only documents tagged `tenant == 'dukes'` are considered.
+
+All three services also propagate the tenant identifier into SLF4J MDC and Micrometer observation context so every log line and distributed trace is tagged with the originating tenant.
+
+## Tenant Configuration
+
+Tenants are declared statically in each service's `application.yml` under the `multitenancy.tenants` key. No database or external registry is required. A `PropertiesTenantDetailsService` loads these properties at startup and exposes them through the `TenantDetailsService` interface consumed by all multitenancy components.
+
+Each service stores only the fields it needs:
+
+- **edge-service** — `identifier`, `enabled`, `client-id`, `client-secret`, `issuer`
+- **instrument-service** — `identifier`, `enabled`, `schema`, `issuer`
+- **chat-service** — `identifier`, `enabled`
+
+A tenant with `enabled: false` (such as `trixie`) is recognized but actively rejected at runtime — requests claiming that tenant identity are refused before any downstream processing occurs.
+
+```yaml
+# edge-service application.yml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/trixie
+```
+
+```yaml
+# instrument-service application.yml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      schema: BEANS
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      schema: TRIXIE
+      issuer: http://localhost:8080/realms/trixie
+```
+
+<Note>
+  Keeping tenant configuration in `application.yml` is intentional for this sample. In a production system you would typically load tenant details from a dedicated store (database, configuration service, etc.) and implement `TenantDetailsService` against that source.
+</Note>
+
+## Observability
+
+All three services export traces to an OpenTelemetry collector on `http://localhost:4318/v1/traces` and expose Prometheus metrics. The logging pattern for each service includes `[traceId-spanId] [tenantId]`, so tenant identity is present in every log line and can be correlated with distributed traces in Grafana.

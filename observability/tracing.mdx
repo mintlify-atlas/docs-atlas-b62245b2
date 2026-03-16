@@ -1,0 +1,198 @@
+---
+title: "Distributed Tracing"
+description: "OpenTelemetry distributed tracing with Grafana Tempo"
+---
+
+Every HTTP request flowing through the Spring Boot services is captured as a distributed trace and forwarded to **Grafana Tempo** via **Grafana Alloy**. The full trace lifecycle — from the incoming HTTP request down to individual JDBC queries — is visible in Grafana, and each trace is tagged with the active `tenantId`.
+
+## Dependencies
+
+Both `instrument-service` and `chat-service` declare the same tracing dependencies in `build.gradle`:
+
+```groovy
+implementation 'io.micrometer:micrometer-tracing-bridge-otel'
+implementation 'io.opentelemetry:opentelemetry-exporter-otlp'
+```
+
+- `micrometer-tracing-bridge-otel` bridges the Micrometer Tracing API to the OpenTelemetry SDK, so all Spring-instrumented observations (HTTP server, HTTP client, JDBC via datasource-micrometer, etc.) produce OTLP-compatible spans.
+- `opentelemetry-exporter-otlp` is the OTLP exporter that ships spans over HTTP to Grafana Alloy.
+
+`instrument-service` additionally includes JDBC observability:
+
+```groovy
+implementation 'net.ttddyy.observation:datasource-micrometer-spring-boot:1.0.3'
+```
+
+This wraps the `DataSource` with a Micrometer observation, producing child spans for every SQL query executed within a request trace.
+
+## Spring Boot Configuration
+
+Both services share the same tracing configuration in `application.yml`:
+
+```yaml
+management:
+  opentelemetry:
+    resource-attributes:
+      application: ${spring.application.name}
+      "service.name": ${spring.application.name}
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 1.0
+  metrics:
+    distribution:
+      percentiles-histogram:
+        all: true
+        http.server.requests: true
+```
+
+- `endpoint` points to Grafana Alloy's HTTP OTLP receiver on port `4318`.
+- `sampling.probability: 1.0` records 100% of traces — suitable for development and demonstration.
+- `resource-attributes` sets `service.name` and `application` on every exported span, which the Grafana Tempo datasource uses to correlate traces with metrics and logs.
+- `percentiles-histogram` enables native histograms for all metrics and HTTP server requests, which Tempo uses to generate span-metrics and allows exemplar attachment.
+
+## Grafana Alloy as the OTLP Collector
+
+Grafana Alloy acts as the central OTLP collection point, decoupling the services from Tempo directly. The relevant section of `config.alloy`:
+
+```hcl
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "localhost:4317"
+  }
+
+  http {
+    endpoint = "localhost:4318"
+  }
+
+  output {
+    logs    = [otelcol.processor.memory_limiter.default.input]
+    metrics = [otelcol.processor.memory_limiter.default.input]
+    traces  = [otelcol.processor.memory_limiter.default.input]
+  }
+}
+
+otelcol.processor.memory_limiter "default" {
+  check_interval         = "1s"
+  limit_percentage       = 85
+  spike_limit_percentage = 20
+
+  output {
+    logs    = [otelcol.processor.batch.default.input]
+    metrics = [otelcol.processor.batch.default.input]
+    traces  = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    metrics = [otelcol.exporter.otlp.default.input]
+    logs    = [otelcol.exporter.otlp.default.input]
+    traces  = [otelcol.exporter.otlp.default.input]
+  }
+}
+
+otelcol.exporter.otlp "default" {
+  client {
+    endpoint = env("TEMPO_URL")
+    tls {
+      insecure = true
+    }
+  }
+}
+```
+
+The pipeline is: **receive → memory-limit → batch → export to Tempo**. The memory limiter protects Alloy from OOM under high load; the batch processor improves throughput.
+
+## Grafana Tempo
+
+Tempo is configured in `tempo.yml` to accept traces in multiple formats and generate derived signals:
+
+```yaml
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+        http:
+    jaeger:
+      protocols:
+        thrift_http:
+        grpc:
+        thrift_binary:
+        thrift_compact:
+    zipkin:
+
+metrics_generator:
+  storage:
+    path: /tmp/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
+
+overrides:
+  metrics_generator_processors: [service-graphs, span-metrics]
+```
+
+**Metrics generator processors:**
+
+- `service-graphs`: Builds a directed graph of inter-service call relationships and exposes it as Prometheus metrics. Grafana renders this as the **Node Graph** panel in the Tempo datasource.
+- `span-metrics`: Derives RED metrics (rate, error rate, duration) from span data and remote-writes them to Prometheus. These metrics are queryable in Prometheus and linked from the Tempo datasource's `tracesToMetrics` configuration.
+
+Generated metrics are remote-written to Prometheus at `http://prometheus:9090/api/v1/write` with exemplars enabled, allowing histogram panels in Grafana to link directly to the trace that produced an outlier data point.
+
+## Tenant ID in Traces
+
+The `TenantContextFilter` adds the resolved tenant identifier as a high-cardinality span attribute on every request trace:
+
+```java
+private void configureTraces(String tenantId, HttpServletRequest request) {
+    ServerHttpObservationFilter.findObservationContext(request).ifPresent(context ->
+            context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+}
+```
+
+This attaches `tenant.id` to the root HTTP server span using the Micrometer `ObservationContext` API. The value is visible as a span attribute in Tempo's trace view, and the Tempo datasource `tracesToLogs` config maps the `org` tag to enable log correlation per tenant.
+
+## Traces → Logs and Metrics Links
+
+The Tempo Grafana datasource in `datasources.yml` is configured to link from a trace to both logs and metrics:
+
+```yaml
+jsonData:
+  tracesToMetrics:
+    datasourceUid: prometheus
+    tags:
+      - { key: 'service.name', value: 'application' }
+      - { key: 'method' }
+      - { key: 'uri' }
+      - { key: 'outcome' }
+      - { key: 'status' }
+    queries:
+      - name: 'Throughput'
+        query: 'sum(rate(http_server_requests_seconds_count{$$__tags}[$$__rate_interval]))'
+      - name: 'Latency'
+        query: 'histogram_quantile(1.00, sum(rate(http_server_requests_seconds_bucket{$$__tags}[$$__rate_interval])) by (le))'
+  tracesToLogs:
+    datasourceUid: 'loki'
+    mappedTags:
+      - { key: 'service.name', value: 'application' }
+    mapTagNamesEnabled: true
+    filterByTraceID: true
+    lokiSearch: true
+  nodeGraph:
+    enabled: true
+```
+
+## Viewing Traces in Grafana
+
+1. Open Grafana at [http://localhost:3000](http://localhost:3000).
+2. Navigate to **Explore** and select the **Tempo** datasource.
+3. Use the **Search** tab to query by service name, duration, or span attributes such as `tenant.id`.
+4. Click any trace to open the waterfall view. From there, use the **Logs** button to jump to the correlated Loki log stream for that trace ID.
+
+<Tip>
+The Grafana service map (Node Graph) is available in the Tempo datasource explore view. It visualises call rates and error rates between services derived from `service-graphs` metrics generated by Tempo.
+</Tip>

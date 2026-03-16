@@ -1,0 +1,163 @@
+---
+title: "Metrics"
+description: "Prometheus metrics with Micrometer and Grafana dashboards"
+---
+
+All Spring Boot services expose Prometheus-format metrics via Micrometer. Grafana Alloy scrapes those endpoints and remote-writes data to Prometheus. Grafana provides pre-built dashboards for JVM health, HTTP traffic, and JDBC connection pools.
+
+## Dependencies
+
+Both services include the Prometheus registry as a runtime dependency:
+
+```groovy
+// instrument-service and chat-service build.gradle
+runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
+```
+
+`instrument-service` also includes JDBC-level metrics:
+
+```groovy
+implementation 'net.ttddyy.observation:datasource-micrometer-spring-boot:1.0.3'
+```
+
+This library wraps the `DataSource` with Micrometer observations, producing both trace spans and metrics for every SQL statement executed. It integrates with Spring Boot's auto-configuration and requires no additional code.
+
+## Spring Boot Configuration
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        all: true
+        http.server.requests: true
+  prometheus:
+    metrics:
+      export:
+        step: 5s
+```
+
+- All actuator endpoints are exposed, including `/actuator/prometheus`.
+- `metrics.tags.application` adds the service name as a common tag to every metric, enabling per-service filtering in Prometheus and Grafana.
+- `percentiles-histogram.all: true` enables native histograms for all metrics, which Prometheus can store natively and Grafana can render as heatmaps.
+- `prometheus.metrics.export.step: 5s` aligns the metrics export cadence with Alloy's 5-second scrape interval.
+
+## Grafana Alloy Scrape Configuration
+
+Alloy scrapes three Spring Boot service endpoints and the Keycloak metrics endpoint. The relevant block from `config.alloy`:
+
+```hcl
+prometheus.scrape "services" {
+  targets = [
+    {
+      __address__      = "host.docker.internal:80",
+      __metrics_path__ = "/actuator/prometheus",
+      job              = "services/spring-boot",
+    },
+    {
+      __address__      = "host.docker.internal:8181",
+      __metrics_path__ = "/actuator/prometheus",
+      job              = "services/spring-boot",
+    },
+    {
+      __address__      = "host.docker.internal:8282",
+      __metrics_path__ = "/actuator/prometheus",
+      job              = "services/spring-boot",
+    },
+    {
+      __address__      = "host.docker.internal:8080",
+      __metrics_path__ = "/metrics",
+      job              = "services/quarkus",
+      application      = "keycloak",
+    },
+  ]
+
+  job_name        = "services"
+  scrape_interval = "5s"
+  scrape_timeout  = "5s"
+
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+```
+
+Alloy also exports its own self-metrics and PostgreSQL metrics via built-in exporters:
+
+```hcl
+prometheus.exporter.self "default" {}
+
+prometheus.exporter.postgres "default" {
+  data_source_names = [
+    "postgresql://" + env("POSTGRES_USER") + ":" + env("POSTGRES_PASSWORD") + "@postgres:5432/grafana?sslmode=disable",
+  ]
+}
+
+prometheus.scrape "exporters" {
+  targets = concat(
+    prometheus.exporter.self.default.targets,
+    prometheus.exporter.postgres.default.targets,
+  )
+  job_name        = "integrations"
+  scrape_interval = "10s"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+```
+
+All scraped metrics are forwarded via remote-write with `send_native_histograms = true` and enriched with `environment` and `hostname` external labels.
+
+## Tempo Span Metrics and Service Graphs
+
+Beyond the scraped application metrics, Grafana Tempo's metrics generator produces additional Prometheus metrics from trace data and remote-writes them directly to Prometheus:
+
+- **`span-metrics`**: RED metrics (request rate, error rate, duration histograms) derived per service, operation, and status.
+- **`service-graphs`**: Call-graph edge metrics representing request rates and latencies between services.
+
+These are written to Prometheus at `http://prometheus:9090/api/v1/write` with exemplars, connecting histogram outliers back to the originating trace.
+
+## Pre-built Grafana Dashboards
+
+Grafana ships with pre-provisioned dashboards for the services:
+
+| Dashboard | What it shows |
+|---|---|
+| **JVM (Micrometer)** | Heap and non-heap memory, GC pause duration and frequency, thread states, class loading |
+| **Spring Boot HTTP** | Request rate, error rate, and latency percentiles per endpoint |
+| **Spring Boot JDBC** | Connection pool utilisation, query execution time, active connections (instrument-service only) |
+| **Prometheus Stats** | Prometheus server health, scrape durations, storage utilisation |
+
+<Tip>
+All dashboards include a **service** variable backed by the `application` label. Use it to switch between `instrument-service`, `chat-service`, or any other scraped service without duplicating dashboards.
+</Tip>
+
+## Accessing Prometheus and Grafana
+
+**Grafana dashboards:** [http://localhost:3000](http://localhost:3000)
+
+Navigate to **Dashboards** in the left sidebar to find the pre-provisioned dashboards listed above.
+
+**Prometheus query UI:** [http://localhost:9090](http://localhost:9090)
+
+Use the Prometheus expression browser to run ad-hoc PromQL queries. For example, to see the HTTP request rate for `instrument-service`:
+
+```promql
+sum(rate(http_server_requests_seconds_count{application="instrument-service"}[1m])) by (uri, status)
+```
+
+To see JDBC query latency:
+
+```promql
+histogram_quantile(0.99, sum(rate(jdbc_query_seconds_bucket{application="instrument-service"}[1m])) by (le, query))
+```
+
+**Grafana Alloy admin UI:** [http://localhost:12345](http://localhost:12345)
+
+The Alloy admin interface displays the component graph, component health, and live metric values for each pipeline stage.
+
+<Note>
+Prometheus in this project is configured to receive data exclusively via remote-write from Alloy and Tempo. The `prometheus.yml` only includes a self-scrape job for Prometheus itself. All application metrics arrive through Alloy's remote-write pipeline.
+</Note>

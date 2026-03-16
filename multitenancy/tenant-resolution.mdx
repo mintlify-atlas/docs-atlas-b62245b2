@@ -1,0 +1,236 @@
+---
+title: "Tenant Resolution"
+description: "How each service identifies the current tenant from an incoming request, validates it against the configured tenant list, and stores it in the thread-local context."
+---
+
+Tenant resolution is the first step in every request: before any business logic runs, the application must determine *which* tenant is making the call. The strategy differs between the edge layer and the backend services.
+
+## Resolution strategies by service
+
+<CardGroup cols={2}>
+  <Card title="edge-service" icon="globe">
+    Extracts the tenant from the **subdomain** of the incoming hostname. A request to `dukes.rock` resolves to tenant `dukes`. The `TenantAuthenticationEntryPoint` performs this extraction and redirects unauthenticated users to the correct OAuth2 login flow.
+  </Card>
+  <Card title="instrument-service & chat-service" icon="server">
+    Reads the tenant from the `X-TenantId` **HTTP request header**. The edge-service gateway automatically injects this header when it proxies requests downstream via the `AddRequestHeader=X-TenantId,{tenant}` route filter.
+  </Card>
+</CardGroup>
+
+## The `TenantResolver` interface
+
+Both strategies implement a common functional interface that accepts an arbitrary source context and returns a nullable tenant identifier string:
+
+```java TenantResolver.java
+/**
+ * Strategy used to resolve the current tenant from a given source context.
+ */
+@FunctionalInterface
+public interface TenantResolver<T> {
+
+    /**
+     * Resolves a tenant identifier from the given source.
+     */
+    @Nullable
+    String resolveTenantIdentifier(T source);
+
+}
+```
+
+The generic parameter `T` is the source type. For HTTP header resolution it is `HttpServletRequest`; custom resolvers could accept a JWT, a WebSocket session, or any other type.
+
+## `HttpHeaderTenantResolver`
+
+The `instrument-service` and `chat-service` use this resolver. It reads the `X-TenantId` header and returns its value verbatim:
+
+```java HttpHeaderTenantResolver.java
+@Component
+public class HttpHeaderTenantResolver implements TenantResolver<HttpServletRequest> {
+
+    private static final String TENANT_HEADER = "X-TenantId";
+
+    @Override
+    @Nullable
+    public String resolveTenantIdentifier(HttpServletRequest request) {
+        return request.getHeader(TENANT_HEADER);
+    }
+
+}
+```
+
+The header name is defined as a constant. If the header is absent the method returns `null`, which `TenantContextFilter` treats as a resolution failure.
+
+## `TenantContextFilter`
+
+`TenantContextFilter` is a `OncePerRequestFilter` that wires resolution, validation, and context-setting together:
+
+```java TenantContextFilter.java
+@Component
+public class TenantContextFilter extends OncePerRequestFilter {
+
+    private final HttpHeaderTenantResolver httpRequestTenantResolver;
+    private final TenantDetailsService tenantDetailsService;
+
+    public TenantContextFilter(HttpHeaderTenantResolver httpHeaderTenantResolver,
+                               TenantDetailsService tenantDetailsService) {
+        this.httpRequestTenantResolver = httpHeaderTenantResolver;
+        this.tenantDetailsService = tenantDetailsService;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+        var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+        if (StringUtils.hasText(tenantIdentifier) && isTenantValid(tenantIdentifier)) {
+            TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+            configureLogs(tenantIdentifier);
+            configureTraces(tenantIdentifier, request);
+        } else {
+            throw new TenantResolutionException(
+                "A valid tenant must be specified for requests to %s"
+                    .formatted(request.getRequestURI()));
+        }
+
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            clear();
+        }
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return request.getRequestURI().startsWith("/actuator");
+    }
+
+    private boolean isTenantValid(String tenantIdentifier) {
+        var tenantDetails = tenantDetailsService.loadTenantByIdentifier(tenantIdentifier);
+        return tenantDetails != null && tenantDetails.enabled();
+    }
+
+    private void configureLogs(String tenantId) {
+        MDC.put("tenantId", tenantId);
+    }
+
+    private void configureTraces(String tenantId, HttpServletRequest request) {
+        ServerHttpObservationFilter.findObservationContext(request).ifPresent(context ->
+            context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+    }
+
+    private void clear() {
+        MDC.remove("tenantId");
+        TenantContextHolder.clear();
+    }
+
+}
+```
+
+<Note>
+  The filter validates the resolved tenant against the enabled tenant list *before* setting the context. A non-null header value that does not match a known, enabled tenant causes a `TenantResolutionException` — it is never silently accepted. Actuator endpoints are excluded from tenant resolution via `shouldNotFilter`.
+</Note>
+
+## Tenant data model
+
+### `TenantDetails` record
+
+Each service defines a `TenantDetails` record that holds per-tenant configuration. The `instrument-service` version carries the database schema name and the Keycloak issuer URL:
+
+```java TenantDetails.java
+/**
+ * Provides core tenant information.
+ */
+public record TenantDetails(
+        String identifier,
+        boolean enabled,
+        String schema,
+        String issuer
+) {}
+```
+
+The `edge-service` variant holds OAuth2 client credentials instead of a schema:
+
+```java TenantDetails.java (edge-service)
+public record TenantDetails(
+        String identifier,
+        boolean enabled,
+        String clientId,
+        String clientSecret,
+        String issuer
+) {}
+```
+
+### `TenantDetailsProperties`
+
+Tenant definitions are loaded from `application.yml` using Spring Boot's `@ConfigurationProperties`:
+
+```java TenantDetailsProperties.java
+@ConfigurationProperties(prefix = "multitenancy")
+public record TenantDetailsProperties(List<TenantDetails> tenants) { }
+```
+
+### `TenantDetailsService` and `PropertiesTenantDetailsService`
+
+`TenantDetailsService` is the core DAO interface:
+
+```java TenantDetailsService.java
+public interface TenantDetailsService {
+
+    List<TenantDetails> loadAllTenants();
+
+    @Nullable
+    TenantDetails loadTenantByIdentifier(String identifier);
+
+}
+```
+
+The `PropertiesTenantDetailsService` implementation reads from the properties list and filters out disabled tenants:
+
+```java PropertiesTenantDetailsService.java
+@Service
+public class PropertiesTenantDetailsService implements TenantDetailsService {
+
+    private final TenantDetailsProperties tenantDetailsProperties;
+
+    public PropertiesTenantDetailsService(TenantDetailsProperties tenantDetailsProperties) {
+        this.tenantDetailsProperties = tenantDetailsProperties;
+    }
+
+    @Override
+    public List<TenantDetails> loadAllTenants() {
+        return tenantDetailsProperties.tenants();
+    }
+
+    @Override
+    public TenantDetails loadTenantByIdentifier(String identifier) {
+        return tenantDetailsProperties.tenants().stream()
+                .filter(TenantDetails::enabled)
+                .filter(tenantDetails -> identifier.equals(tenantDetails.identifier()))
+                .findFirst().orElse(null);
+    }
+
+}
+```
+
+## YAML configuration
+
+Tenants are declared under `multitenancy.tenants` in `application.yml`. Each entry maps directly to a `TenantDetails` record:
+
+```yaml application.yml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      schema: BEANS
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      schema: TRIXIE
+      issuer: http://localhost:8080/realms/trixie
+```
+
+The `trixie` tenant is declared but `enabled: false`. It will never be admitted through `TenantContextFilter` — `PropertiesTenantDetailsService.loadTenantByIdentifier` filters it out before returning.

@@ -1,0 +1,206 @@
+---
+title: "Request Flow"
+description: "A step-by-step walkthrough of how a request travels from the browser through edge-service to instrument-service or chat-service, with full tenant context at every hop."
+---
+
+This page traces the exact path a request takes through the system, showing which component handles it at each stage and what tenant-specific logic is applied.
+
+<Tabs>
+  <Tab title="Instrument Request">
+
+    The following steps walk through a user navigating to `http://dukes.rock/instruments/` for the first time (unauthenticated).
+
+    <Steps>
+      <Step title="Browser → edge-service: Unauthenticated request">
+        The browser sends `GET http://dukes.rock/instruments/`.
+
+        Spring Cloud Gateway evaluates route predicates. The route with `Host={tenant}.rock` and `Path=/instruments/**` matches, binding `tenant = dukes`.
+
+        Spring Security intercepts the request. No session cookie is present, so the request is unauthenticated. `TenantAuthenticationEntryPoint` fires:
+
+        ```java
+        var tenantId = exchange.getRequest().getURI().getHost().split("\\.")[0]; // "dukes"
+        var tenantLoginLocation = URI.create("/oauth2/authorization/" + tenantId);
+        this.requestCache.saveRequest(exchange)  // saves original URL to session
+            .then(this.redirectStrategy.sendRedirect(exchange, tenantLoginLocation));
+        ```
+
+        The browser is redirected to `/oauth2/authorization/dukes`.
+      </Step>
+
+      <Step title="edge-service → Keycloak: OIDC authorization">
+        Spring Security's OAuth2 login filter handles `/oauth2/authorization/dukes`. It calls `TenantClientRegistrationRepository.findByRegistrationId("dukes")`.
+
+        On the first call, `buildClientRegistration` discovers the Keycloak OIDC configuration from `http://localhost:8080/realms/dukes/.well-known/openid-configuration` and constructs a `ClientRegistration`. Subsequent calls return the cached entry from the `ConcurrentHashMap`.
+
+        The browser is redirected to the Keycloak login page for the `dukes` realm. The user enters `isabelle / password`.
+      </Step>
+
+      <Step title="Keycloak → edge-service: Authorization code exchange">
+        Keycloak redirects back to `http://dukes.rock/login/oauth2/code/dukes` with an authorization code.
+
+        edge-service exchanges the code for tokens (ID token + access token). A session is created. The original request URL (`/instruments/`) is restored from the session cache.
+      </Step>
+
+      <Step title="edge-service → instrument-service: Proxied request with tenant header and JWT">
+        The authenticated request for `/instruments/` is matched by the gateway route again. Two filters run:
+
+        1. **`TokenRelay`** (default filter) — reads the OAuth2 access token from the session and appends `Authorization: Bearer <jwt>` to the outgoing request.
+        2. **`TenantGatewayFilterFactory`** (via `AddRequestHeader=X-TenantId,{tenant}`) — expands `{tenant}` to `dukes`, adds `X-TenantId: dukes` to the outgoing request, and records `tenant.id=dukes` in the Micrometer observation context for the current trace span.
+
+        instrument-service receives:
+        ```
+        GET /instruments/
+        X-TenantId: dukes
+        Authorization: Bearer eyJhbGciOiJSUzI1NiIsIn...
+        ```
+      </Step>
+
+      <Step title="instrument-service: Tenant context established">
+        `TenantContextFilter` (`OncePerRequestFilter`) runs early in the filter chain:
+
+        - `HttpHeaderTenantResolver` reads `X-TenantId: dukes`.
+        - `TenantDetailsService` verifies `dukes` is a known, enabled tenant.
+        - `TenantContextHolder.setTenantIdentifier("dukes")` stores it in the `ThreadLocal`.
+        - `MDC.put("tenantId", "dukes")` tags all subsequent log output for this request.
+        - A Micrometer `tenant.id=dukes` high-cardinality key is added to the active observation.
+
+        ```java
+        TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+        MDC.put("tenantId", tenantIdentifier);
+        configureTraces(tenantIdentifier, request);
+        ```
+      </Step>
+
+      <Step title="instrument-service: JWT validated against dukes realm">
+        Spring Security's resource server filter runs. `TenantAuthenticationManagerResolver.resolve()` is called:
+
+        ```java
+        var tenantId = TenantContextHolder.getRequiredTenantIdentifier(); // "dukes"
+        return authenticationManagers.computeIfAbsent(tenantId, this::buildAuthenticationManager);
+        ```
+
+        The resolved `AuthenticationManager` validates the JWT signature and claims against `http://localhost:8080/realms/dukes`. A JWT issued by the `beans` realm would fail this check.
+      </Step>
+
+      <Step title="instrument-service: Hibernate switches to DUKES schema">
+        `InstrumentController.getInstruments()` calls `instrumentRepository.findAll()`.
+
+        Before Hibernate issues the SQL query, `TenantIdentifierResolver.resolveCurrentTenantIdentifier()` returns `"dukes"`. Hibernate calls `ConnectionProvider.getConnection("dukes")`:
+
+        ```java
+        var schema = tenantDetails.schema(); // "DUKES"
+        Connection connection = dataSource.getConnection();
+        connection.setSchema(schema); // SET search_path = DUKES
+        return connection;
+        ```
+
+        The SQL `SELECT` runs against the `DUKES` schema. No instruments from the `BEANS` schema are accessible.
+
+        After the query returns, the connection is released: `connection.setSchema("DEFAULT")` resets it before returning it to the pool.
+      </Step>
+
+      <Step title="Response returned through edge-service to browser">
+        `instrument-service` returns a JSON array of instruments. `TenantContextFilter`'s `finally` block runs: `MDC.remove("tenantId")` and `TenantContextHolder.clear()` clean up the `ThreadLocal`.
+
+        edge-service proxies the response back to the browser. The browser renders the list of Dukes instruments.
+      </Step>
+    </Steps>
+
+  </Tab>
+  <Tab title="Chat Request">
+
+    The following steps walk through a request to `POST http://dukes.rock/ai/doc/chat` with body `"What instruments does dukes play?"`. The user is already authenticated.
+
+    <Note>
+      The gateway configuration in this sample routes `/instruments/**` to instrument-service. The chat endpoint would be reached via a similarly configured route for `/ai/**`. The tenant flow is identical: edge-service adds `X-TenantId` and forwards the JWT.
+    </Note>
+
+    <Steps>
+      <Step title="Browser → edge-service: Authenticated POST">
+        The browser sends `POST http://dukes.rock/ai/doc/chat` with a session cookie. Spring Security finds a valid session; the user is authenticated.
+
+        The gateway route for the chat path matches and applies the same two filters as the instrument flow: `TokenRelay` and `TenantGatewayFilterFactory`, producing:
+
+        ```
+        POST /ai/doc/chat
+        X-TenantId: dukes
+        Authorization: Bearer eyJhbGciOiJSUzI1NiIsIn...
+        ```
+      </Step>
+
+      <Step title="chat-service: Tenant context established">
+        `TenantContextFilter` (identical pattern to instrument-service) reads `X-TenantId: dukes`, validates it against the tenant list, sets the `ThreadLocal`, populates MDC, and tags the active Micrometer observation.
+
+        <Note>
+          chat-service does not validate the JWT itself — it trusts the edge-service to have already authenticated the user. The `Authorization` header is forwarded but not verified by chat-service's security configuration.
+        </Note>
+      </Step>
+
+      <Step title="chat-service: ChromaDB similarity search filtered by tenant">
+        `DocumentChatController` delegates to `DocumentChatService.chatWithDocument(message)`.
+
+        The service queries ChromaDB with a metadata filter derived from the `ThreadLocal`:
+
+        ```java
+        List<Document> similarDocuments = vectorStore.similaritySearch(
+            SearchRequest
+                .query(message)
+                .withFilterExpression("tenant == 'dukes'")
+                .withTopK(3));
+        ```
+
+        ChromaDB applies `tenant == 'dukes'` as a pre-filter. Only document chunks loaded with `textReader.getCustomMetadata().put("tenant", "dukes")` are candidates for the cosine similarity ranking. Documents tagged `tenant=beans` are completely excluded.
+
+        The top-3 most similar document chunks are returned.
+      </Step>
+
+      <Step title="chat-service: RAG prompt assembled and sent to Ollama">
+        The retrieved document chunks are joined and injected into a system prompt template:
+
+        ```java
+        var systemPromptTemplate = new SystemPromptTemplate("""
+            You're assisting with questions about rock bands ...
+
+            DOCUMENTS:
+            {documents}
+            """);
+
+        var systemMessage = systemPromptTemplate.createMessage(Map.of("documents", documents));
+        var userMessage = new UserMessage(message);
+        var prompt = new Prompt(List.of(systemMessage, userMessage));
+
+        var chatResponse = chatClient.call(prompt); // calls Ollama llama2
+        ```
+
+        Ollama's `llama2` model generates a response grounded in the Dukes-specific documents.
+      </Step>
+
+      <Step title="Response returned through edge-service to browser">
+        The assistant's reply is returned as a plain string from `DocumentChatController`. `TenantContextFilter`'s `finally` block clears the `ThreadLocal` and MDC.
+
+        edge-service proxies the chat response back to the browser.
+      </Step>
+    </Steps>
+
+  </Tab>
+</Tabs>
+
+## Tenant Isolation at Each Layer
+
+The table below summarizes which component enforces isolation at each layer and what happens if the tenant identifier is absent or invalid.
+
+| Layer | Component | Isolation Mechanism | On Failure |
+|---|---|---|---|
+| Routing | Spring Cloud Gateway `Host` predicate | Subdomain → tenant binding | No route match → 404 |
+| Login redirect | `TenantAuthenticationEntryPoint` | Redirects to tenant-specific Keycloak realm | Login page for wrong realm |
+| OAuth2 registration | `TenantClientRegistrationRepository` | Per-tenant `ClientRegistration` from OIDC discovery | `TenantResolutionException` |
+| Header extraction | `TenantContextFilter` | Reads `X-TenantId`, validates against tenant list | `TenantResolutionException` → HTTP error |
+| JWT validation | `TenantAuthenticationManagerResolver` | Validates JWT against tenant's Keycloak issuer | `401 Unauthorized` |
+| Database | `ConnectionProvider` + `TenantIdentifierResolver` | Sets PostgreSQL schema per connection | Wrong schema / default schema |
+| Cache | `TenantKeyGenerator` | Prefixes cache keys with tenant identifier | Shared cache key collision |
+| Vector store | `DocumentChatService` filter expression | ChromaDB metadata filter `tenant == '<id>'` | Cross-tenant document leak |
+
+<Note>
+  The `ThreadLocal` in `TenantContextHolder` is safe for Spring MVC because each request runs on a dedicated thread. If you migrate a service to a reactive stack (Spring WebFlux), you must replace `ThreadLocal` with a reactor `Context` or a similar reactive propagation mechanism.
+</Note>

@@ -1,0 +1,350 @@
+---
+title: "Instrument Service"
+description: "REST API with schema-per-tenant PostgreSQL and per-tenant JWT validation"
+---
+
+The instrument service is a Spring MVC REST API running on port `8181`. It stores musical instruments in a PostgreSQL database using a **schema-per-tenant** strategy: each tenant gets a dedicated PostgreSQL schema (`DUKES`, `BEANS`, etc.), and Hibernate switches schemas at connection time based on the current tenant. JWT validation is also per-tenant — each tenant's tokens are verified against their own Keycloak realm.
+
+## Tech stack
+
+| Component | Dependency |
+|---|---|
+| Web | `spring-boot-starter-web` (Spring MVC) |
+| Data | `spring-boot-starter-data-jpa`, `postgresql` |
+| Security | `spring-boot-starter-oauth2-resource-server` |
+| Migrations | `flyway-core` |
+| Caching | `spring-boot-starter-cache` |
+| Observability | Micrometer + OpenTelemetry OTLP, Prometheus, Loki, `datasource-micrometer` |
+| Testing | Testcontainers + `testcontainers:postgresql` |
+| Java | 21, Spring Boot 3.2.4 |
+
+<Note>
+To run with a fully auto-configured PostgreSQL container (via Testcontainers), use `./gradlew bootTestRun`. This launches an ephemeral PostgreSQL instance and runs all Flyway migrations automatically — no local database required.
+</Note>
+
+## API endpoints
+
+### GET /instruments
+
+Returns all instruments stored in the current tenant's schema. Requires a valid Bearer token.
+
+**Response fields**
+
+<ResponseField name="id" type="string (UUID)">
+  Unique identifier for the instrument, auto-generated as a UUID.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Name of the instrument (e.g., `"Fender Stratocaster"`). Required, must not be empty.
+</ResponseField>
+
+<ResponseField name="type" type="string">
+  Category or type of the instrument (e.g., `"guitar"`). Optional.
+</ResponseField>
+
+**Example response**
+
+```json
+[
+  {
+    "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "name": "Fender Stratocaster",
+    "type": "guitar"
+  },
+  {
+    "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "name": "Ludwig Accent",
+    "type": "drums"
+  }
+]
+```
+
+### GET /instruments/\{type\}
+
+Returns all instruments matching the given `type`. Results are cached per tenant using Spring Cache with a tenant-aware key generator (`tenantKeyGenerator`), so cache entries from different tenants never collide.
+
+<ParamField path="type" type="string" required>
+  The instrument type to filter by (e.g., `guitar`, `drums`, `bass`).
+</ParamField>
+
+The controller method is annotated with `@Cacheable(cacheNames = "instrumentTypes", keyGenerator = "tenantKeyGenerator")`. The `TenantKeyGenerator` prepends the current tenant identifier to the `SimpleKey` generated from the method parameters:
+
+```java
+@Override
+public Object generate(Object target, Method method, Object... params) {
+    return SimpleKeyGenerator.generateKey(TenantContextHolder.getRequiredTenantIdentifier(), params);
+}
+```
+
+This means a cache entry for `guitar` under tenant `dukes` has a different key than `guitar` under tenant `beans`.
+
+### POST /instruments
+
+Creates a new instrument in the current tenant's schema. Requires a valid Bearer token.
+
+**Request body**
+
+<ParamField body="name" type="string" required>
+  Name of the instrument. Must not be empty (`@NotEmpty` is enforced by Bean Validation).
+</ParamField>
+
+<ParamField body="type" type="string">
+  Optional instrument type.
+</ParamField>
+
+**Example request**
+
+```bash
+curl -X POST http://localhost:8181/instruments \
+  -H "Authorization: Bearer <token>" \
+  -H "X-TenantId: dukes" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Gibson Les Paul", "type": "guitar"}'
+```
+
+**Example response**
+
+```json
+{
+  "id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "name": "Gibson Les Paul",
+  "type": "guitar"
+}
+```
+
+## Configuration
+
+```yaml
+server:
+  port: 8181
+
+spring:
+  application:
+    name: instrument-service
+  flyway:
+    locations: classpath:db/migration/default
+    schemas: default
+
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        all: true
+        http.server.requests: true
+  opentelemetry:
+    resource-attributes:
+      application: ${spring.application.name}
+      "service.name": ${spring.application.name}
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 1.0
+  prometheus:
+    metrics:
+      export:
+        step: 5s
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      show-components: always
+
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      schema: BEANS
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      schema: TRIXIE
+      issuer: http://localhost:8080/realms/trixie
+```
+
+Each entry in `multitenancy.tenants` is a `TenantDetails` record:
+
+```java
+public record TenantDetails(
+    String identifier,
+    boolean enabled,
+    String schema,
+    String issuer
+) {}
+```
+
+Spring Boot's `@ConfigurationProperties(prefix = "multitenancy")` on `TenantDetailsProperties` binds the list at startup.
+
+## Key components
+
+### TenantContextFilter
+
+`TenantContextFilter` is an `OncePerRequestFilter` that runs before the `BearerTokenAuthenticationFilter`. It reads the `X-TenantId` header (populated by the edge service) and stores the value in `TenantContextHolder`, a `ThreadLocal`-backed store:
+
+```java
+@Override
+protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+        FilterChain filterChain) throws ServletException, IOException {
+    var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+    if (StringUtils.hasText(tenantIdentifier) && isTenantValid(tenantIdentifier)) {
+        TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+        configureLogs(tenantIdentifier);    // sets MDC tenantId
+        configureTraces(tenantIdentifier, request); // tags observation span
+    } else {
+        throw new TenantResolutionException(...);
+    }
+
+    try {
+        filterChain.doFilter(request, response);
+    } finally {
+        clear(); // always removes MDC and ThreadLocal
+    }
+}
+```
+
+Actuator paths (`/actuator/**`) bypass this filter.
+
+### TenantAuthenticationManagerResolver
+
+Implements `AuthenticationManagerResolver<HttpServletRequest>`. On each request, it reads the current tenant from `TenantContextHolder` and returns a tenant-specific `AuthenticationManager` — backed by a `JwtAuthenticationProvider` pointed at that tenant's Keycloak issuer. Resolved managers are cached in a `ConcurrentHashMap`.
+
+```java
+@Override
+public AuthenticationManager resolve(HttpServletRequest request) {
+    var tenantId = TenantContextHolder.getRequiredTenantIdentifier();
+    return authenticationManagers.computeIfAbsent(tenantId, this::buildAuthenticationManager);
+}
+
+private AuthenticationManager buildAuthenticationManager(String tenantId) {
+    var issuerUri = tenantDetailsService.loadTenantByIdentifier(tenantId).issuer();
+    var jwtAuthenticationProvider =
+        new JwtAuthenticationProvider(JwtDecoders.fromIssuerLocation(issuerUri));
+    return jwtAuthenticationProvider::authenticate;
+}
+```
+
+This means a `dukes` JWT is only validated against `http://localhost:8080/realms/dukes`, and a `beans` JWT against `http://localhost:8080/realms/beans`.
+
+### Hibernate multitenancy: TenantIdentifierResolver
+
+`TenantIdentifierResolver` implements Hibernate's `CurrentTenantIdentifierResolver`. It reads from `TenantContextHolder` and falls back to the sentinel value `"DEFAULT"` when no tenant is present (e.g., during schema initialization):
+
+```java
+@Override
+public String resolveCurrentTenantIdentifier() {
+    return Objects.requireNonNullElse(
+        TenantContextHolder.getTenantIdentifier(), DEFAULT_TENANT);
+}
+```
+
+It also implements `HibernatePropertiesCustomizer` to register itself with Hibernate:
+
+```java
+@Override
+public void customize(Map<String, Object> hibernateProperties) {
+    hibernateProperties.put(AvailableSettings.MULTI_TENANT_IDENTIFIER_RESOLVER, this);
+}
+```
+
+### Hibernate multitenancy: ConnectionProvider
+
+`ConnectionProvider` implements Hibernate's `MultiTenantConnectionProvider`. When Hibernate needs a connection for a given tenant, it fetches one from the shared `DataSource` and calls `connection.setSchema(schema)`, where `schema` is looked up from `TenantDetailsService`:
+
+```java
+@Override
+public Connection getConnection(String tenantIdentifier) throws SQLException {
+    var tenantDetails = tenantDetailsService.loadTenantByIdentifier(tenantIdentifier);
+    var schema = tenantDetails != null ? tenantDetails.schema() : tenantIdentifier;
+    Connection connection = dataSource.getConnection();
+    connection.setSchema(schema);
+    return connection;
+}
+
+@Override
+public void releaseConnection(String tenantIdentifier, Connection connection)
+        throws SQLException {
+    connection.setSchema("DEFAULT");
+    connection.close();
+}
+```
+
+The connection is always reset to `DEFAULT` on release to avoid schema leakage between requests.
+
+## Database migrations
+
+The service runs two sets of Flyway migrations:
+
+- **Default schema** (`classpath:db/migration/default`) — runs first via Spring Boot's built-in `FlywayMigrationInitializer`. Contains administrative tables.
+- **Per-tenant schemas** (`classpath:db/migration/tenant`) — run by `TenantFlywayMigrationInitializer`, which executes after the default migration (`Ordered` with value `1`). It iterates all tenants from `TenantDetailsService` and runs migrations against each tenant's schema.
+
+`TenantFlywayMigrationInitializer` reuses the `Flyway` configuration (datasource, config) from the default `Flyway` bean but overrides `locations` and `schemas`:
+
+```java
+private Flyway tenantFlyway(String schema) {
+    return Flyway.configure()
+            .configuration(defaultFlyway.getConfiguration())
+            .locations(TENANT_MIGRATION_LOCATION)  // "db/migration/tenant"
+            .dataSource(dataSource)
+            .schemas(schema)
+            .load();
+}
+```
+
+The tenant migration that creates the `instrument` table:
+
+```sql
+CREATE TABLE instrument(
+   id      UUID PRIMARY KEY,
+   name    VARCHAR(255) NOT NULL,
+   type    VARCHAR(255)
+);
+```
+
+This migration runs independently in each tenant schema (`DUKES`, `BEANS`), producing fully isolated tables.
+
+## Running the service
+
+<Steps>
+  <Step title="Start the service with Testcontainers">
+    From the `instrument-service` directory:
+
+    ```bash
+    ./gradlew bootTestRun
+    ```
+
+    This uses `spring-boot-testcontainers` to auto-configure and start a PostgreSQL container. All Flyway migrations run automatically on startup.
+  </Step>
+  <Step title="Start the service against a local database">
+    If you have a PostgreSQL instance running locally, configure the datasource in `application.yml` and run:
+
+    ```bash
+    ./gradlew bootRun
+    ```
+  </Step>
+  <Step title="Verify the API">
+    Send a request with a valid Bearer token and the tenant header:
+
+    ```bash
+    curl http://localhost:8181/instruments \
+      -H "Authorization: Bearer <token>" \
+      -H "X-TenantId: dukes"
+    ```
+  </Step>
+</Steps>

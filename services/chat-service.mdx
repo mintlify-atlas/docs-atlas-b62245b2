@@ -1,0 +1,281 @@
+---
+title: "Chat Service"
+description: "AI chat service with per-tenant RAG using Spring AI, Ollama, and ChromaDB"
+---
+
+The chat service provides AI-powered chat endpoints backed by a local Ollama LLM (`llama2`). It runs on port `8282` and implements two interaction modes:
+
+- **Simple chat** — a plain prompt forwarded directly to the model
+- **Document chat** — a retrieval-augmented generation (RAG) pipeline that retrieves only the current tenant's documents from ChromaDB before constructing the prompt
+
+The service does not perform its own authentication. It trusts the `X-TenantId` header forwarded by the edge service and uses it to scope all AI operations to the correct tenant.
+
+## Tech stack
+
+| Component | Dependency |
+|---|---|
+| Web | `spring-boot-starter-web` (Spring MVC) |
+| AI / LLM | `spring-ai-ollama-spring-boot-starter:0.8.1` |
+| Vector store | `spring-ai-chroma-store-spring-boot-starter:0.8.1` |
+| Observability | Micrometer + OpenTelemetry OTLP, Prometheus, Loki |
+| Testing | Testcontainers (Ollama + ChromaDB containers) |
+| Java | 21, Spring Boot 3.2.4, virtual threads enabled |
+
+<Tip>
+When running without Testcontainers (`./gradlew bootRun`), you must have Ollama installed locally and the `llama2` model pulled:
+
+```bash
+ollama run llama2
+```
+
+Ollama must be running and accessible at `http://localhost:11434` (the default). ChromaDB must also be running locally.
+</Tip>
+
+## API endpoints
+
+### POST /ai/simple/chat
+
+Forwards a plain text message directly to the Ollama `llama2` model with no additional context. Useful for general questions that do not require tenant-specific knowledge.
+
+**Request body**
+
+<ParamField body="message" type="string" required>
+  The plain text message to send to the model. Sent as a raw string body (Content-Type: text/plain).
+</ParamField>
+
+**Example**
+
+```bash
+curl -X POST http://localhost:8282/ai/simple/chat \
+  -H "X-TenantId: dukes" \
+  -H "Content-Type: text/plain" \
+  -d "Who plays bass in a typical rock band?"
+```
+
+The controller implementation:
+
+```java
+@PostMapping("/ai/simple/chat")
+String chat(@RequestBody String message) {
+    return chatClient.call(message);
+}
+```
+
+### POST /ai/doc/chat
+
+Runs the full RAG pipeline: retrieves tenant-filtered documents from ChromaDB, injects them into a system prompt, then calls the `llama2` model with the combined prompt. Only documents tagged with the current tenant's identifier are used.
+
+**Request body**
+
+<ParamField body="message" type="string" required>
+  The plain text question or message. Sent as a raw string body.
+</ParamField>
+
+**Example**
+
+```bash
+curl -X POST http://localhost:8282/ai/doc/chat \
+  -H "X-TenantId: dukes" \
+  -H "Content-Type: text/plain" \
+  -d "Tell me about the band's history"
+```
+
+The `dukes` tenant will receive answers grounded in `story1.md`; the `beans` tenant will receive answers grounded in `story2.txt`. No cross-tenant document leakage is possible because ChromaDB filters are applied at query time.
+
+## Configuration
+
+```yaml
+server:
+  port: 8282
+
+spring:
+  application:
+    name: chat-service
+  ai:
+    ollama:
+      chat:
+        model: llama2
+      embedding:
+        model: llama2
+  threads:
+    virtual:
+      enabled: true
+
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        all: true
+        http.server.requests: true
+  opentelemetry:
+    resource-attributes:
+      application: ${spring.application.name}
+      "service.name": ${spring.application.name}
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 1.0
+  prometheus:
+    metrics:
+      export:
+        step: 5s
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      show-components: always
+
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+    - identifier: beans
+      enabled: true
+    - identifier: trixie
+      enabled: false
+```
+
+Both `llama2` chat and embedding models are configured under `spring.ai.ollama`. Virtual threads are enabled for improved concurrency when handling blocking AI calls.
+
+## Tenant document initialization
+
+On startup, `DocumentInitializer` (annotated `@PostConstruct`) loads two story documents from the classpath and writes them into ChromaDB as vector embeddings. Each document is tagged with a `tenant` metadata field before storage:
+
+```java
+@PostConstruct
+public void run() {
+    List<Document> documents = new ArrayList<>();
+
+    // story1.md is the dukes tenant's document
+    var textReader1 = new TextReader(textFile1);       // classpath:documents/story1.md
+    textReader1.getCustomMetadata().put("tenant", "dukes");
+    documents.addAll(textReader1.get());
+
+    // story2.txt is the beans tenant's document
+    var textReader2 = new TextReader(textFile2);       // classpath:documents/story2.txt
+    textReader2.getCustomMetadata().put("tenant", "beans");
+    documents.addAll(textReader2.get());
+
+    // Split into token-sized chunks and embed
+    var tokenizedDocuments = new TokenTextSplitter().apply(documents);
+    vectorStore.add(tokenizedDocuments);
+}
+```
+
+The `TokenTextSplitter` splits long documents into chunks that fit within the embedding model's context window. Each chunk inherits the `tenant` metadata from its parent document.
+
+| Document | Tenant | Content |
+|---|---|---|
+| `story1.md` | `dukes` | Band story for the `dukes` tenant |
+| `story2.txt` | `beans` | Band story for the `beans` tenant |
+
+## RAG pipeline
+
+`DocumentChatService` implements the full retrieval-augmented generation flow:
+
+<Steps>
+  <Step title="Read tenant from context">
+    The current tenant identifier is read from `TenantContextHolder`, which was populated by `TenantContextFilter` from the `X-TenantId` header:
+
+    ```java
+    TenantContextHolder.getRequiredTenantIdentifier()
+    ```
+  </Step>
+  <Step title="Similarity search with tenant filter">
+    ChromaDB is queried for the top-3 most relevant document chunks. A metadata filter expression ensures only documents belonging to the current tenant are considered:
+
+    ```java
+    List<Document> similarDocuments = vectorStore.similaritySearch(
+        SearchRequest
+            .query(message)
+            .withFilterExpression("tenant == '%s'"
+                .formatted(TenantContextHolder.getRequiredTenantIdentifier()))
+            .withTopK(3));
+    ```
+  </Step>
+  <Step title="Build system prompt">
+    The retrieved document chunks are joined and injected into a system prompt template:
+
+    ```java
+    var systemPromptTemplate = new SystemPromptTemplate("""
+        You're assisting with questions about rock bands, their story,
+        their members, and their music.
+
+        Use the information from the DOCUMENTS section to provide accurate
+        answers and assume no prior knowledge, but act as if you knew this
+        information innately. If unsure, simply state that you don't know.
+
+        DOCUMENTS:
+        {documents}
+        """);
+
+    String documents = similarDocuments.stream()
+        .map(Document::getContent)
+        .collect(Collectors.joining(System.lineSeparator()));
+    var systemMessage = systemPromptTemplate.createMessage(Map.of("documents", documents));
+    ```
+  </Step>
+  <Step title="Call the model">
+    The system message and user message are combined into a `Prompt` and sent to `llama2` via the `ChatClient`:
+
+    ```java
+    var prompt = new Prompt(List.of(systemMessage, new UserMessage(message)));
+    var chatResponse = chatClient.call(prompt);
+    return chatResponse.getResult().getOutput();
+    ```
+  </Step>
+</Steps>
+
+## Tenant context propagation
+
+Tenant resolution in the chat service follows the same pattern as the instrument service:
+
+1. `TenantContextFilter` (an `OncePerRequestFilter`) reads `X-TenantId` via `HttpHeaderTenantResolver`.
+2. It validates the tenant against `TenantDetailsService` (backed by `multitenancy.tenants` in `application.yml`).
+3. The tenant identifier is stored in `TenantContextHolder` (a `ThreadLocal`) for the duration of the request.
+4. MDC and the Micrometer observation context are tagged with `tenantId` for correlated logging and tracing.
+5. The `ThreadLocal` is cleared in the `finally` block.
+
+Actuator endpoints (`/actuator/**`) bypass the filter.
+
+## Running the service
+
+<Steps>
+  <Step title="Run with Testcontainers (recommended)">
+    From the `chat-service` directory:
+
+    ```bash
+    ./gradlew bootTestRun
+    ```
+
+    This spins up Ollama and ChromaDB containers automatically. The `llama2` model is pulled into the Ollama container on first run, so startup may take several minutes.
+  </Step>
+  <Step title="Run against local Ollama">
+    Ensure Ollama is running locally with the `llama2` model and ChromaDB is accessible, then:
+
+    ```bash
+    ./gradlew bootRun
+    ```
+  </Step>
+  <Step title="Send a document chat request">
+    ```bash
+    curl -X POST http://localhost:8282/ai/doc/chat \
+      -H "X-TenantId: dukes" \
+      -H "Content-Type: text/plain" \
+      -d "What instruments does the band use?"
+    ```
+  </Step>
+</Steps>

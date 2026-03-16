@@ -1,0 +1,325 @@
+---
+title: "Multitenancy Patterns"
+description: "A deep dive into each of the seven multitenancy patterns used across edge-service, instrument-service, and chat-service — from subdomain routing to per-tenant vector store filtering."
+---
+
+This project implements multitenancy through a layered set of patterns. Each pattern addresses a distinct concern: identifying the tenant, propagating that identity, isolating data, isolating authentication, isolating caches, and isolating AI retrieval. The patterns compose cleanly — each layer trusts the output of the previous one.
+
+<Accordion title="1. Subdomain-Based Tenant Identification">
+
+Tenant identity originates at the HTTP host header. Spring Cloud Gateway is configured with a `Host` predicate that captures the subdomain as the `{tenant}` template variable:
+
+```yaml
+# edge-service application.yml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: instrument-route
+          uri: http://localhost:8181
+          predicates:
+            - Host={tenant}.rock
+            - Path=/instruments/**
+          filters:
+            - AddRequestHeader=X-TenantId,{tenant}
+```
+
+A request to `dukes.rock/instruments/` matches the `Host={tenant}.rock` predicate, and `{tenant}` is bound to `dukes`. The value is later expanded when the `AddRequestHeader` filter executes.
+
+Unauthenticated requests are intercepted by `TenantAuthenticationEntryPoint`, which extracts the subdomain from the request URI and constructs the tenant-specific OAuth2 authorization redirect:
+
+```java
+// TenantAuthenticationEntryPoint.java
+var tenantId = exchange.getRequest().getURI().getHost().split("\\.")[0];
+var tenantLoginLocation = URI.create("/oauth2/authorization/" + tenantId);
+```
+
+This ensures the browser is always sent to the correct Keycloak realm login page for the subdomain it is visiting.
+
+</Accordion>
+
+<Accordion title="2. HTTP Header Propagation (X-TenantId)">
+
+Once the tenant is identified at the gateway, it must be communicated to downstream services. The custom `TenantGatewayFilterFactory` adds an `X-TenantId` request header and simultaneously records the tenant identifier into the Micrometer `ObservabilityContext` for distributed tracing:
+
+```java
+// TenantGatewayFilterFactory.java
+private ServerHttpRequest addTenantToRequest(ServerWebExchange exchange, String tenantId, NameValueConfig config) {
+    var tenantHeader = config.getName(); // "X-TenantId"
+    return exchange.getRequest().mutate()
+        .headers(httpHeaders -> httpHeaders.add(tenantHeader, tenantId))
+        .build();
+}
+
+private void addTenantToObservation(String tenantId, ServerWebExchange exchange) {
+    ServerHttpObservationFilter.findObservationContext(exchange).ifPresent(context ->
+        context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+}
+```
+
+The `TokenRelay` default filter is applied first so the JWT bearer token is also forwarded. Downstream services therefore receive both `X-TenantId` and `Authorization: Bearer <token>` on every proxied request.
+
+In `instrument-service` and `chat-service`, `HttpHeaderTenantResolver` reads the header:
+
+```java
+// HttpHeaderTenantResolver.java
+private static final String TENANT_HEADER = "X-TenantId";
+
+public String resolveTenantIdentifier(HttpServletRequest request) {
+    return request.getHeader(TENANT_HEADER);
+}
+```
+
+</Accordion>
+
+<Accordion title="3. Tenant Context Propagation (TenantContextHolder)">
+
+Once the tenant identifier is extracted from the HTTP header, it is stored in a `ThreadLocal` for the duration of the request. `TenantContextHolder` is a simple, final utility class used identically in both `instrument-service` and `chat-service`:
+
+```java
+// TenantContextHolder.java
+public final class TenantContextHolder {
+    private static final ThreadLocal<String> tenantIdentifier = new ThreadLocal<>();
+
+    public static void setTenantIdentifier(String tenant) { ... }
+    public static String getTenantIdentifier() { ... }
+    public static String getRequiredTenantIdentifier() { ... } // throws if absent
+    public static void clear() { tenantIdentifier.remove(); }
+}
+```
+
+`TenantContextFilter` (an `OncePerRequestFilter`) orchestrates the full lifecycle: resolve → validate → set → continue filter chain → clear in a `finally` block. It also propagates the tenant into SLF4J MDC and Micrometer observations:
+
+```java
+// TenantContextFilter.java (instrument-service)
+@Override
+protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+        throws ServletException, IOException {
+    var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+    if (StringUtils.hasText(tenantIdentifier) && isTenantValid(tenantIdentifier)) {
+        TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+        MDC.put("tenantId", tenantIdentifier); // SLF4J structured logging
+        configureTraces(tenantIdentifier, request); // Micrometer observation tag
+    } else {
+        throw new TenantResolutionException(...);
+    }
+
+    try {
+        filterChain.doFilter(request, response);
+    } finally {
+        MDC.remove("tenantId");
+        TenantContextHolder.clear();
+    }
+}
+```
+
+<Note>
+  Both services use a synchronous `ThreadLocal`-based holder because they are traditional blocking Spring MVC applications. The edge-service, being reactive (Spring Cloud Gateway / WebFlux), does not use a `ThreadLocal` — tenant identity in the reactive chain is carried as gateway exchange attributes and via the `X-TenantId` header it injects.
+</Note>
+
+</Accordion>
+
+<Accordion title="4. Schema-Per-Tenant Database Isolation">
+
+The `instrument-service` stores each tenant's data in a separate PostgreSQL schema. Hibernate's multitenancy support is the integration point. Two components register themselves as Hibernate properties customizers:
+
+**`TenantIdentifierResolver`** — tells Hibernate which tenant to use for the current session by reading from `TenantContextHolder`:
+
+```java
+// TenantIdentifierResolver.java
+@Override
+public String resolveCurrentTenantIdentifier() {
+    return Objects.requireNonNullElse(TenantContextHolder.getTenantIdentifier(), DEFAULT_TENANT);
+}
+
+@Override
+public void customize(Map<String, Object> hibernateProperties) {
+    hibernateProperties.put(AvailableSettings.MULTI_TENANT_IDENTIFIER_RESOLVER, this);
+}
+```
+
+**`ConnectionProvider`** — implements `MultiTenantConnectionProvider` and sets the JDBC connection schema to the tenant's configured schema value before returning the connection:
+
+```java
+// ConnectionProvider.java
+@Override
+public Connection getConnection(String tenantIdentifier) throws SQLException {
+    var tenantDetails = tenantDetailsService.loadTenantByIdentifier(tenantIdentifier);
+    var schema = tenantDetails != null ? tenantDetails.schema() : tenantIdentifier;
+    Connection connection = dataSource.getConnection();
+    connection.setSchema(schema); // switches to e.g. DUKES or BEANS
+    return connection;
+}
+
+@Override
+public void releaseConnection(String tenantIdentifier, Connection connection) throws SQLException {
+    connection.setSchema("DEFAULT"); // restore before returning to pool
+    connection.close();
+}
+```
+
+Schema mapping in `application.yml`:
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      schema: DUKES
+    - identifier: beans
+      schema: BEANS
+```
+
+**Schema migrations** are also per-tenant. `TenantFlywayMigrationInitializer` runs at startup after the default schema migration completes (it has `order = 1`). It iterates over all enabled tenants and runs Flyway against each schema independently, reading migration scripts from `db/migration/tenant/`:
+
+```java
+// TenantFlywayMigrationInitializer.java
+@Override
+public void afterPropertiesSet() {
+    tenantDetailsService.loadAllTenants().forEach(tenant -> {
+        Flyway flyway = tenantFlyway(tenant.schema());
+        flyway.migrate();
+    });
+}
+
+private Flyway tenantFlyway(String schema) {
+    return Flyway.configure()
+            .configuration(defaultFlyway.getConfiguration())
+            .locations("db/migration/tenant")
+            .schemas(schema)
+            .load();
+}
+```
+
+</Accordion>
+
+<Accordion title="5. Per-Tenant OAuth2/OIDC Authentication">
+
+Each tenant has its own Keycloak realm. Authentication in the edge-service and JWT validation in instrument-service are both resolved dynamically at runtime rather than being statically configured.
+
+**Edge-service — `TenantClientRegistrationRepository`**
+
+Implements Spring Security's `ReactiveClientRegistrationRepository`. When OAuth2 login is triggered for a given `registrationId` (which equals the tenant identifier), it looks up the tenant's `issuer`, `clientId`, and `clientSecret` from properties and uses `ClientRegistrations.fromOidcIssuerLocation()` to discover the full OIDC configuration from Keycloak:
+
+```java
+// TenantClientRegistrationRepository.java
+private Mono<ClientRegistration> buildClientRegistration(String registrationId) {
+    var tenantDetails = tenantDetailsService.loadTenantByIdentifier(registrationId);
+    return Mono.just(ClientRegistrations.fromOidcIssuerLocation(tenantDetails.issuer())
+        .registrationId(registrationId)
+        .clientId(tenantDetails.clientId())
+        .clientSecret(tenantDetails.clientSecret())
+        .redirectUri("{baseUrl}/login/oauth2/code/" + registrationId)
+        .scope("openid")
+        .build());
+}
+```
+
+Registrations are cached in a `ConcurrentHashMap` so the OIDC discovery endpoint is only called once per tenant per process lifetime.
+
+**Instrument-service — `TenantAuthenticationManagerResolver`**
+
+Implements Spring Security's `AuthenticationManagerResolver<HttpServletRequest>`. When a request arrives, it reads the current tenant from `TenantContextHolder` and returns an `AuthenticationManager` that validates JWTs against that tenant's Keycloak issuer:
+
+```java
+// TenantAuthenticationManagerResolver.java
+@Override
+public AuthenticationManager resolve(HttpServletRequest request) {
+    var tenantId = TenantContextHolder.getRequiredTenantIdentifier();
+    return authenticationManagers.computeIfAbsent(tenantId, this::buildAuthenticationManager);
+}
+
+private AuthenticationManager buildAuthenticationManager(String tenantId) {
+    var issuerUri = tenantDetailsService.loadTenantByIdentifier(tenantId).issuer();
+    var jwtAuthenticationProvider = new JwtAuthenticationProvider(JwtDecoders.fromIssuerLocation(issuerUri));
+    return jwtAuthenticationProvider::authenticate;
+}
+```
+
+This means a JWT minted by the `beans` realm will be rejected by instrument-service when a request arrives with `X-TenantId: dukes`, because the resolved `AuthenticationManager` expects tokens from `http://localhost:8080/realms/dukes`.
+
+</Accordion>
+
+<Accordion title="6. Tenant-Aware Cache Isolation">
+
+Instrument-service caches query results using Spring's `@Cacheable`. Without isolation, a cached result for tenant `dukes` could be served to tenant `beans` if the cache key were based purely on method arguments.
+
+`TenantKeyGenerator` solves this by prefixing all cache keys with the current tenant identifier:
+
+```java
+// TenantKeyGenerator.java
+@Override
+public Object generate(Object target, Method method, Object... params) {
+    return SimpleKeyGenerator.generateKey(
+        TenantContextHolder.getRequiredTenantIdentifier(), // e.g. "dukes"
+        params // e.g. ["guitar"]
+    );
+}
+```
+
+The generator is referenced by name in `@Cacheable`:
+
+```java
+// InstrumentController.java
+@GetMapping("{type}")
+@Cacheable(cacheNames = "instrumentTypes", keyGenerator = "tenantKeyGenerator")
+List<Instrument> getInstrumentByType(@PathVariable String type) { ... }
+```
+
+A query for `guitar` by the `dukes` tenant produces a cache key of `[dukes, guitar]`, completely separate from `[beans, guitar]`.
+
+</Accordion>
+
+<Accordion title="7. Per-Tenant Vector Store Filtering">
+
+Chat-service uses a Retrieval-Augmented Generation (RAG) pattern backed by ChromaDB. Documents are loaded at startup by `DocumentInitializer`, which attaches a `tenant` metadata field to every document chunk before storing embeddings in ChromaDB:
+
+```java
+// DocumentInitializer.java
+var textReader1 = new TextReader(textFile1);
+textReader1.getCustomMetadata().put("tenant", "dukes");
+
+var textReader2 = new TextReader(textFile2);
+textReader2.getCustomMetadata().put("tenant", "beans");
+
+vectorStore.add(new TokenTextSplitter().apply(documents));
+```
+
+At query time, `DocumentChatService` constructs a filter expression that restricts similarity search results to the current tenant's documents:
+
+```java
+// DocumentChatService.java
+List<Document> similarDocuments = vectorStore.similaritySearch(
+    SearchRequest
+        .query(message)
+        .withFilterExpression("tenant == '%s'"
+            .formatted(TenantContextHolder.getRequiredTenantIdentifier()))
+        .withTopK(3));
+```
+
+For `X-TenantId: dukes`, the filter is `tenant == 'dukes'`. ChromaDB applies this as a metadata pre-filter before computing cosine similarity, so embeddings from the `beans` tenant are never in the candidate set. The retrieved documents are then injected into the system prompt for the Ollama `llama2` model.
+
+</Accordion>
+
+## Pattern Summary
+
+<CardGroup cols={2}>
+  <Card title="Tenant Resolution" icon="magnifying-glass" href="/multitenancy/tenant-resolution">
+    How subdomain and HTTP header strategies identify the tenant at each service boundary.
+  </Card>
+  <Card title="Schema-Per-Tenant" icon="table-columns" href="/multitenancy/schema-per-tenant">
+    Hibernate `MultiTenantConnectionProvider` and `CurrentTenantIdentifierResolver` for schema switching.
+  </Card>
+  <Card title="Per-Tenant Authentication" icon="key" href="/multitenancy/per-tenant-auth">
+    Dynamic OAuth2 client registration and per-tenant JWT validation against Keycloak realms.
+  </Card>
+  <Card title="Tenant Cache Isolation" icon="bolt" href="/multitenancy/tenant-cache-isolation">
+    `TenantKeyGenerator` ensures `@Cacheable` results are never shared across tenants.
+  </Card>
+  <Card title="Vector Store Filtering" icon="brain" href="/multitenancy/vector-store-filtering">
+    ChromaDB metadata filter expressions scope RAG retrieval to the requesting tenant.
+  </Card>
+  <Card title="Tenant Context" icon="layer-group" href="/multitenancy/tenant-context">
+    `TenantContextHolder` ThreadLocal, MDC logging, and Micrometer observation tagging.
+  </Card>
+</CardGroup>

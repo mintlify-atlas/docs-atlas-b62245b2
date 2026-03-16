@@ -1,97 +1,77 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Spring Boot Multitenancy"
+description: "Samples showing how to build multitenant applications with Java 21 and Spring Boot 3.2, featuring schema-per-tenant databases, per-tenant OAuth2/OIDC authentication, and tenant-isolated AI queries."
 ---
 
-## Setting up
+## What is this?
 
-Get your documentation site up and running in minutes.
+This project demonstrates production-ready multitenancy patterns for Java applications using Spring Boot 3.2 and Java 21. It provides three interconnected services that together show how to isolate data, authentication, caching, and AI queries on a per-tenant basis — with full observability via Grafana, Loki, Tempo, and Prometheus.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+Two tenants are pre-configured — **dukes** and **beans** — each with their own Keycloak realm, PostgreSQL schema, and document collection.
 
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Get Started" icon="rocket" href="/quickstart">
+    Run the full stack locally and explore tenant-isolated data in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    Understand how the three services work together to enforce tenant isolation.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Multitenancy Patterns" icon="layers" href="/architecture/multitenancy-patterns">
+    Explore all the multitenancy techniques used in this project.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Services" icon="server" href="/services/edge-service">
+    Dive into edge-service, instrument-service, and chat-service.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key features
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Schema-per-tenant database" icon="database" href="/multitenancy/schema-per-tenant">
+    Each tenant gets its own PostgreSQL schema, enforced by Hibernate's `MultiTenantConnectionProvider`.
+  </Card>
+  <Card title="Per-tenant OAuth2/OIDC" icon="shield-halved" href="/multitenancy/per-tenant-auth">
+    Dynamic Keycloak realm selection so each tenant authenticates against its own identity provider.
+  </Card>
+  <Card title="Subdomain routing" icon="globe" href="/services/edge-service">
+    Spring Cloud Gateway routes `dukes.rock` and `beans.rock` to the correct tenant context automatically.
+  </Card>
+  <Card title="Tenant-isolated cache" icon="bolt" href="/multitenancy/tenant-cache-isolation">
+    Cache keys are prefixed with tenant ID to prevent cross-tenant data leakage.
+  </Card>
+  <Card title="Per-tenant vector store" icon="microchip-ai" href="/multitenancy/vector-store-filtering">
+    ChromaDB metadata filtering ensures AI document retrieval is scoped to the requesting tenant.
+  </Card>
+  <Card title="Full observability" icon="chart-line" href="/observability/overview">
+    Tenant ID flows through MDC logs, Micrometer traces, and Prometheus metrics via Grafana Alloy.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Technology stack
 
-## Need inspiration?
+| Component | Technology |
+|-----------|-----------|
+| Language | Java 21 (virtual threads enabled) |
+| Framework | Spring Boot 3.2 |
+| API Gateway | Spring Cloud Gateway 2023.0.1 |
+| Authentication | Keycloak 24.0 (OIDC/OAuth2) |
+| Database | PostgreSQL 16 with Hibernate multitenancy |
+| Migrations | Flyway (per-tenant schema migrations) |
+| AI/LLM | Spring AI + Ollama (llama2) |
+| Vector Store | ChromaDB |
+| Metrics | Micrometer + Prometheus |
+| Tracing | OpenTelemetry + Grafana Tempo |
+| Logging | Loki4j + Grafana Loki |
+| Dashboards | Grafana OSS |
+| Testing | Testcontainers |
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Project structure
+
+```
+spring-boot-multitenancy/
+├── edge-service/        # API gateway: OAuth2 login, subdomain routing, token relay
+├── instrument-service/  # REST API: schema-per-tenant data, per-tenant JWT validation
+├── chat-service/        # AI service: RAG with per-tenant document filtering
+├── platform/            # Keycloak, Grafana, Loki, Tempo, Prometheus configs
+└── compose.yml          # Docker Compose for all backing services
+```

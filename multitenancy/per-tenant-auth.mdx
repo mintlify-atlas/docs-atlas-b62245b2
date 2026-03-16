@@ -1,0 +1,235 @@
+---
+title: "Per-Tenant Authentication"
+description: "How edge-service drives OAuth2 login per Keycloak realm, and how instrument-service validates JWTs against the correct per-tenant issuer."
+---
+
+Each tenant has its own Keycloak realm (`dukes`, `beans`). Authentication is therefore realm-specific: an `edge-service` user in the `dukes` realm cannot log in via the `beans` realm, and a `beans` JWT will be rejected by `instrument-service` when processing a `dukes` request.
+
+The system has two distinct authentication layers:
+
+| Service | Protocol | Mechanism |
+|---------|----------|-----------|
+| `edge-service` | OAuth2 Authorization Code + OIDC | `TenantClientRegistrationRepository` + `TenantAuthenticationEntryPoint` |
+| `instrument-service` | OAuth2 Resource Server (JWT bearer) | `TenantAuthenticationManagerResolver` |
+
+---
+
+## OAuth2 login in edge-service
+
+### `TenantClientRegistrationRepository`
+
+Spring Security's OAuth2 login requires a `ClientRegistration` for each provider. In a single-tenant application this is static YAML configuration. Here, it is built dynamically at runtime from the tenant registry:
+
+```java TenantClientRegistrationRepository.java
+@Component
+public class TenantClientRegistrationRepository
+        implements ReactiveClientRegistrationRepository {
+
+    private static final Map<String, Mono<ClientRegistration>> clientRegistrations =
+            new ConcurrentHashMap<>();
+
+    private final TenantDetailsService tenantDetailsService;
+
+    public TenantClientRegistrationRepository(TenantDetailsService tenantDetailsService) {
+        this.tenantDetailsService = tenantDetailsService;
+    }
+
+    @Override
+    public Mono<ClientRegistration> findByRegistrationId(String registrationId) {
+        return clientRegistrations.computeIfAbsent(
+                registrationId, this::buildClientRegistration);
+    }
+
+    private Mono<ClientRegistration> buildClientRegistration(String registrationId) {
+        var tenantDetails = tenantDetailsService.loadTenantByIdentifier(registrationId);
+        if (tenantDetails == null) {
+            throw new TenantResolutionException(
+                "A valid tenant must be specified for authentication requests");
+        }
+        return Mono.just(
+            ClientRegistrations.fromOidcIssuerLocation(tenantDetails.issuer())
+                .registrationId(registrationId)
+                .clientId(tenantDetails.clientId())
+                .clientSecret(tenantDetails.clientSecret())
+                .redirectUri("{baseUrl}/login/oauth2/code/" + registrationId)
+                .scope("openid")
+                .build());
+    }
+
+}
+```
+
+`ClientRegistrations.fromOidcIssuerLocation` performs OIDC discovery against `<issuer>/.well-known/openid-configuration` the first time a tenant is seen. The result is cached in the `ConcurrentHashMap`, so subsequent requests pay no discovery overhead.
+
+The `edge-service` `TenantDetails` record carries the OAuth2 client credentials:
+
+```java TenantDetails.java (edge-service)
+public record TenantDetails(
+        String identifier,
+        boolean enabled,
+        String clientId,
+        String clientSecret,
+        String issuer
+) {}
+```
+
+These map directly to the YAML tenant configuration:
+
+```yaml application.yml (edge-service)
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+```
+
+### `TenantAuthenticationEntryPoint`
+
+When an unauthenticated request arrives, Spring Security invokes the configured `AuthenticationEntryPoint`. `TenantAuthenticationEntryPoint` extracts the tenant from the request's subdomain and redirects to the corresponding OAuth2 login URL:
+
+```java TenantAuthenticationEntryPoint.java
+@Component
+public class TenantAuthenticationEntryPoint
+        implements ServerAuthenticationEntryPoint {
+
+    private ServerRedirectStrategy redirectStrategy =
+            new DefaultServerRedirectStrategy();
+    private ServerRequestCache requestCache =
+            new WebSessionServerRequestCache();
+
+    @Override
+    public Mono<Void> commence(ServerWebExchange exchange,
+                               AuthenticationException ex) {
+        var baseLoginUri = "/oauth2/authorization/";
+        var tenantId = exchange.getRequest().getURI()
+                .getHost().split("\\.")[0];              // "dukes.rock" → "dukes"
+        var tenantLoginLocation = URI.create(baseLoginUri + tenantId);
+        return this.requestCache.saveRequest(exchange)
+                .then(this.redirectStrategy.sendRedirect(
+                        exchange, tenantLoginLocation));
+    }
+
+}
+```
+
+A request to `dukes.rock/instruments` that lacks a session triggers a redirect to `/oauth2/authorization/dukes`. Spring Security then uses `TenantClientRegistrationRepository.findByRegistrationId("dukes")` to find the correct Keycloak realm and begins the authorization code flow.
+
+### `SecurityConfig` (edge-service)
+
+```java SecurityConfig.java (edge-service)
+@Configuration(proxyBeanMethods = false)
+public class SecurityConfig {
+
+    @Bean
+    SecurityWebFilterChain springSecurityFilterChain(
+            ServerHttpSecurity http,
+            TenantClientRegistrationRepository clientRegistrationRepository) {
+        return http
+            .authorizeExchange(exchange -> exchange
+                .pathMatchers("/actuator/**", "/tenant-login/**").permitAll()
+                .anyExchange().authenticated())
+            .oauth2Login(oauth2 -> oauth2
+                .clientRegistrationRepository(clientRegistrationRepository))
+            .exceptionHandling(exception -> exception
+                .authenticationEntryPoint(new TenantAuthenticationEntryPoint()))
+            .build();
+    }
+
+}
+```
+
+---
+
+## JWT validation in instrument-service
+
+### `TenantAuthenticationManagerResolver`
+
+`instrument-service` is an OAuth2 resource server. Rather than a single, static JWT decoder, it resolves a per-tenant `AuthenticationManager` — one per Keycloak realm — based on the tenant stored in `TenantContextHolder`:
+
+```java TenantAuthenticationManagerResolver.java
+@Component
+public class TenantAuthenticationManagerResolver
+        implements AuthenticationManagerResolver<HttpServletRequest> {
+
+    private static final Map<String, AuthenticationManager> authenticationManagers =
+            new ConcurrentHashMap<>();
+    private final TenantDetailsService tenantDetailsService;
+
+    public TenantAuthenticationManagerResolver(
+            TenantDetailsService tenantDetailsService) {
+        this.tenantDetailsService = tenantDetailsService;
+    }
+
+    @Override
+    public AuthenticationManager resolve(HttpServletRequest request) {
+        var tenantId = TenantContextHolder.getRequiredTenantIdentifier();
+        return authenticationManagers.computeIfAbsent(
+                tenantId, this::buildAuthenticationManager);
+    }
+
+    private AuthenticationManager buildAuthenticationManager(String tenantId) {
+        var issuerUri = tenantDetailsService
+                .loadTenantByIdentifier(tenantId).issuer();
+        var jwtAuthenticationProvider = new JwtAuthenticationProvider(
+                JwtDecoders.fromIssuerLocation(issuerUri));
+        return jwtAuthenticationProvider::authenticate;
+    }
+
+}
+```
+
+`JwtDecoders.fromIssuerLocation` fetches the JWKS endpoint from the issuer's well-known metadata, and the resulting `JwtDecoder` is cached in a `ConcurrentHashMap`. Every subsequent request for the same tenant reuses the cached decoder.
+
+<Note>
+  A JWT issued by the `beans` Keycloak realm will be rejected when processing a `dukes` request, because the `JwtDecoder` cached for `dukes` validates signatures against the `dukes` JWKS, not `beans`. Cross-realm token reuse is therefore structurally impossible.
+</Note>
+
+### `SecurityConfig` (instrument-service)
+
+```java SecurityConfig.java (instrument-service)
+@Configuration(proxyBeanMethods = false)
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain securityFilterChain(
+            HttpSecurity http,
+            AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver,
+            TenantContextFilter tenantContextFilter) throws Exception {
+        return http
+            .authorizeHttpRequests(request -> request
+                .requestMatchers("/actuator/**").permitAll()
+                .anyRequest().authenticated())
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .authenticationManagerResolver(authenticationManagerResolver))
+            .addFilterBefore(tenantContextFilter, BearerTokenAuthenticationFilter.class)
+            .build();
+    }
+
+}
+```
+
+<Warning>
+  `TenantContextFilter` must run **before** `BearerTokenAuthenticationFilter`. The resolver calls `TenantContextHolder.getRequiredTenantIdentifier()` inside its `resolve` method — if that executes before the tenant is stored in the context, it throws `TenantNotFoundException`. The explicit `.addFilterBefore(tenantContextFilter, BearerTokenAuthenticationFilter.class)` guarantees the correct order.
+</Warning>
+
+## Keycloak realm structure
+
+Each tenant maps to a dedicated Keycloak realm:
+
+```yaml instrument-service YAML
+multitenancy:
+  tenants:
+    - identifier: dukes
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      issuer: http://localhost:8080/realms/beans
+```
+
+The issuer URL is the canonical identity of the realm. `JwtDecoders.fromIssuerLocation` appends `/.well-known/openid-configuration` to discover the JWKS URI, token endpoint, and other metadata automatically.

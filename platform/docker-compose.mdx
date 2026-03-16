@@ -1,0 +1,86 @@
+---
+title: "Docker Compose"
+description: "Run all backing services with Docker Compose"
+---
+
+The `compose.yml` at the project root starts every infrastructure service the multitenancy sample depends on — identity, observability, and data storage. The Spring Boot applications themselves are run separately (e.g. via `./gradlew bootRun` or your IDE), not as Compose services.
+
+## Starting the platform
+
+```bash
+# Start all services in the background
+docker compose up -d
+
+# Tail logs for a specific service
+docker compose logs -f keycloak
+
+# Stop everything and remove containers
+docker compose down
+```
+
+Wait ~20–30 seconds after `up -d` for Keycloak to finish realm import before starting the Spring Boot apps.
+
+## Services
+
+| Service | Image | Port(s) | Purpose |
+|---------|-------|---------|---------|
+| `keycloak` | `quay.io/keycloak/keycloak:24.0` | `8080` | OAuth2/OIDC identity provider, one realm per tenant |
+| `chroma` | `ghcr.io/chroma-core/chroma:0.4.24` | `8000` | Vector database used by `chat-service` |
+| `postgres` | `docker.io/library/postgres:16.2` | *(internal)* | PostgreSQL instance used as Grafana's backend database |
+| `grafana` | `docker.io/grafana/grafana-oss:10.4.2` | `3000` | Observability dashboards (metrics, traces, logs) |
+| `loki` | `docker.io/grafana/loki:2.9.7` | `3100` | Log aggregation, fed by Alloy via Docker log discovery |
+| `prometheus` | `quay.io/prometheus/prometheus:v2.51.2` | `9090` *(internal)* | Metrics storage, scraped by Alloy from Spring Boot actuator endpoints |
+| `tempo` | `docker.io/grafana/tempo:2.4.1` | `3110`, `4317`, `4318`, `9411` | Distributed tracing backend (OTLP gRPC/HTTP, Zipkin) |
+| `alloy` | `docker.io/grafana/alloy:v1.0.0` | `12345`, `4317`, `4318` | Grafana Alloy — OTLP collector, log scraper, metrics forwarder |
+
+<Warning>
+Both `alloy` and `tempo` expose gRPC OTLP on port `4317`. Docker Compose maps Alloy's `4317` to the host, and Tempo's `4317` remains internal. Spring Boot applications should send traces to **`http://localhost:4318`** (HTTP OTLP) rather than `4317` (gRPC) to avoid ambiguity. The `edge-service` is already configured with `management.otlp.tracing.endpoint: http://localhost:4318/v1/traces`.
+</Warning>
+
+## Named volumes
+
+Three named volumes provide persistence across container restarts:
+
+| Volume | Used by | Contents |
+|--------|---------|----------|
+| `alloy-data` | `alloy` | Alloy WAL (write-ahead log) for metrics and logs |
+| `grafana-data` | `grafana` | Grafana state: plugins, sessions, alert history |
+| `postgres-data` | `postgres` | PostgreSQL data directory for the Grafana database |
+
+To wipe all platform state and start fresh:
+
+```bash
+docker compose down -v
+```
+
+## Environment variables
+
+Several services accept a `HOST_NAME` variable to configure their advertised hostname. This is used when the Compose stack is deployed to a remote host so that Alloy, Prometheus, Tempo, Loki, and Grafana all resolve each other correctly.
+
+```bash
+HOST_NAME=my-server.example.com docker compose up -d
+```
+
+When running locally, `HOST_NAME` defaults to `localhost` via `${HOST_NAME:-localhost}`.
+
+Alloy also reads three internal service URLs from environment variables set directly in `compose.yml`:
+
+```yaml
+environment:
+  - LOKI_URL=http://loki:3100/loki/api/v1/push
+  - PROMETHEUS_URL=http://prometheus:9090/api/v1/write
+  - TEMPO_URL=http://tempo:4317
+```
+
+## Services started by Spring Boot apps
+
+<Note>
+Not every dependency is started by Docker Compose. Two services are managed by the Spring Boot applications themselves using Testcontainers:
+
+- **PostgreSQL for `instrument-service`** — started automatically by Testcontainers when `instrument-service` boots (using the `spring-boot-testcontainers` integration).
+- **Ollama and Chroma for `chat-service`** — started by Testcontainers when `chat-service` is run via `./gradlew bootTestRun`. The `chroma` service in `compose.yml` is an alternative when you want a persistent Chroma instance outside of the test lifecycle.
+</Note>
+
+## Alloy admin UI
+
+Grafana Alloy exposes a built-in admin interface at **[http://localhost:12345](http://localhost:12345)**. From there you can inspect pipeline component health, view live metric targets, and debug log/trace pipelines.

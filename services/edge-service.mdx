@@ -1,0 +1,241 @@
+---
+title: "Edge Service"
+description: "API gateway with subdomain routing and per-tenant OAuth2 login"
+---
+
+The edge service is the single entry point for all client traffic. It runs on port `80` using Spring Cloud Gateway over WebFlux and is responsible for:
+
+- **Subdomain routing** — requests to `<tenant>.rock` are matched and forwarded to downstream services
+- **Per-tenant OAuth2 login** — unauthenticated requests are redirected to the correct Keycloak realm based on the subdomain
+- **Token relay** — after login, the gateway appends the OAuth2 access token to every downstream request via the `TokenRelay` filter
+- **Tenant header propagation** — a custom gateway filter injects `X-TenantId` into proxied requests so downstream services can identify the tenant
+
+## Tech stack
+
+| Component | Dependency |
+|---|---|
+| Gateway | `spring-cloud-starter-gateway` |
+| Reactive web | `spring-boot-starter-webflux` |
+| OAuth2 login | `spring-boot-starter-oauth2-client` |
+| Observability | Micrometer + OpenTelemetry OTLP, Prometheus, Loki |
+| Java | 21, Spring Boot 3.2.4, Spring Cloud 2023.0.1 |
+
+<Note>
+The `main` method calls `Hooks.enableAutomaticContextPropagation()` before starting the application. This is required so that Reactor's `Context` (carrying trace and tenant data) propagates transparently across reactive operator boundaries without manual threading.
+
+```java
+public static void main(String[] args) {
+    Hooks.enableAutomaticContextPropagation();
+    SpringApplication.run(EdgeServiceApplication.class, args);
+}
+```
+</Note>
+
+## Configuration
+
+The full `application.yml` is shown below. Key sections:
+
+- The gateway route matches any host of the form `{tenant}.rock` and path `/instruments/**`, then adds an `X-TenantId` request header using the captured `{tenant}` template variable.
+- The `multitenancy.tenants` list is loaded by `TenantDetailsProperties` and drives both `TenantClientRegistrationRepository` and `PropertiesTenantDetailsService`. The `trixie` tenant is disabled, so it will be rejected at login time.
+
+```yaml
+server:
+  port: 80
+
+spring:
+  application:
+    name: edge-service
+
+  cloud:
+    gateway:
+      default-filters:
+        - SaveSession
+        - TokenRelay
+      routes:
+        - id: instrument-route
+          uri: http://localhost:8181
+          predicates:
+            - Host={tenant}.rock
+            - Path=/instruments/**
+          filters:
+            - AddRequestHeader=X-TenantId,{tenant}
+
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        all: true
+        http.server.requests: true
+  opentelemetry:
+    resource-attributes:
+      application: ${spring.application.name}
+      "service.name": ${spring.application.name}
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 1.0
+  prometheus:
+    metrics:
+      export:
+        step: 5s
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      show-components: always
+
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/trixie
+```
+
+## Key components
+
+### TenantAuthenticationEntryPoint
+
+When an unauthenticated request arrives, Spring Security calls the `ServerAuthenticationEntryPoint`. This implementation extracts the first subdomain label from the request host, then redirects to `/oauth2/authorization/<tenant>` — which triggers Spring Security's OAuth2 login flow for the correct tenant.
+
+```java
+@Override
+public Mono<Void> commence(ServerWebExchange exchange, AuthenticationException ex) {
+    var baseLoginUri = "/oauth2/authorization/";
+    var tenantId = exchange.getRequest().getURI().getHost().split("\\.")[0];
+    var tenantLoginLocation = URI.create(baseLoginUri + tenantId);
+    return this.requestCache.saveRequest(exchange)
+            .then(this.redirectStrategy.sendRedirect(exchange, tenantLoginLocation));
+}
+```
+
+For example, a request to `dukes.rock/instruments` from an unauthenticated user redirects to `/oauth2/authorization/dukes`. Spring Security then asks `TenantClientRegistrationRepository` for the `dukes` registration.
+
+### TenantClientRegistrationRepository
+
+Implements `ReactiveClientRegistrationRepository`. Instead of statically declaring client registrations in `application.yml`, it builds a `ClientRegistration` on demand by reading the tenant's `issuer`, `clientId`, and `clientSecret` from `TenantDetailsService`. Built registrations are cached in a `ConcurrentHashMap` so OIDC discovery only runs once per tenant.
+
+```java
+@Override
+public Mono<ClientRegistration> findByRegistrationId(String registrationId) {
+    return clientRegistrations.computeIfAbsent(registrationId, this::buildClientRegistration);
+}
+
+private Mono<ClientRegistration> buildClientRegistration(String registrationId) {
+    var tenantDetails = tenantDetailsService.loadTenantByIdentifier(registrationId);
+    if (tenantDetails == null) {
+        throw new TenantResolutionException("A valid tenant must be specified for authentication requests");
+    }
+    return Mono.just(ClientRegistrations.fromOidcIssuerLocation(tenantDetails.issuer())
+        .registrationId(registrationId)
+        .clientId(tenantDetails.clientId())
+        .clientSecret(tenantDetails.clientSecret())
+        .redirectUri("{baseUrl}/login/oauth2/code/" + registrationId)
+        .scope("openid")
+        .build());
+}
+```
+
+The `TenantDetails` record that drives this lookup is:
+
+```java
+public record TenantDetails(
+    String identifier,
+    boolean enabled,
+    String clientId,
+    String clientSecret,
+    String issuer
+) {}
+```
+
+It is populated from `multitenancy.tenants[*]` in `application.yml` via `@ConfigurationProperties(prefix = "multitenancy")`.
+
+### TenantGatewayFilterFactory
+
+A custom `GatewayFilterFactory` that extends the built-in `AddRequestHeader` filter with one extra responsibility: it tags the Micrometer observation context with `tenant.id` so all spans emitted by the gateway carry the tenant as a high-cardinality key value.
+
+```java
+@Override
+public GatewayFilter apply(NameValueConfig config) {
+    return (exchange, chain) -> {
+        String tenantId = ServerWebExchangeUtils.expand(exchange, config.getValue());
+        ServerHttpRequest request = addTenantToRequest(exchange, tenantId, config);
+        addTenantToObservation(tenantId, exchange);
+        return chain.filter(exchange.mutate().request(request).build());
+    };
+}
+
+private void addTenantToObservation(String tenantId, ServerWebExchange exchange) {
+    ServerHttpObservationFilter.findObservationContext(exchange).ifPresent(context ->
+        context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+}
+```
+
+In `application.yml` the filter is referenced as `AddRequestHeader=X-TenantId,{tenant}` (the built-in name), but because `TenantGatewayFilterFactory` is registered as a `@Component`, Spring Cloud Gateway resolves it from the bean factory and uses it in place of the stock filter.
+
+### SecurityConfig
+
+The `SecurityWebFilterChain` wires together all the pieces above:
+
+```java
+@Bean
+SecurityWebFilterChain springSecurityFilterChain(
+        ServerHttpSecurity http,
+        TenantClientRegistrationRepository clientRegistrationRepository) {
+    return http
+        .authorizeExchange(exchange -> exchange
+            .pathMatchers("/actuator/**", "/tenant-login/**").permitAll()
+            .anyExchange().authenticated())
+        .oauth2Login(oauth2 -> oauth2
+            .clientRegistrationRepository(clientRegistrationRepository))
+        .exceptionHandling(exception ->
+            exception.authenticationEntryPoint(new TenantAuthenticationEntryPoint()))
+        .build();
+}
+```
+
+`/actuator/**` is open so liveness/readiness probes work without auth. All other paths require an authenticated session.
+
+## Running the service
+
+<Steps>
+  <Step title="Start Keycloak">
+    The service requires a running Keycloak instance with `dukes` and `beans` realms configured. Refer to the infrastructure setup guide for details.
+  </Step>
+  <Step title="Run the application">
+    From the `edge-service` directory:
+
+    ```bash
+    ./gradlew bootRun
+    ```
+
+    The gateway listens on port `80`.
+  </Step>
+  <Step title="Verify the gateway">
+    Navigate to `http://dukes.rock/instruments` in a browser (ensure `dukes.rock` resolves to `127.0.0.1` in your hosts file). You should be redirected to Keycloak's `dukes` realm login page.
+  </Step>
+</Steps>

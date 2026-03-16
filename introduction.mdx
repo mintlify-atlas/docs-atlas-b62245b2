@@ -1,0 +1,63 @@
+---
+title: "Introduction"
+description: "A reference sample demonstrating multitenancy patterns in Spring Boot 3.2 with microservices, OAuth2, schema-per-tenant databases, and per-tenant AI context."
+---
+
+## What is this project?
+
+This project is a reference implementation for building multitenant applications with Spring Boot 3.2 and Java 21. It demonstrates several complementary multitenancy strategies across three microservices, showing how tenant isolation can be applied at the routing, data, authentication, and AI layers of a production-grade system.
+
+Two rock band tenants are pre-configured — `dukes` and `beans` — each with their own subdomain, Keycloak realm, database schema, and AI knowledge base. A third tenant, `trixie`, is defined but disabled, showing how tenant lifecycle management works.
+
+## Services
+
+### edge-service (port 80)
+
+Spring Cloud Gateway acts as the entry point for all tenant traffic. It resolves the tenant from the request's subdomain (`{tenant}.rock`) using a `Host` predicate, propagates the tenant identity downstream via an `X-TenantId` request header, and handles OAuth2 login by dynamically selecting the correct Keycloak realm per tenant. The `TokenRelay` filter forwards the user's access token to upstream services.
+
+### instrument-service (port 8181)
+
+A REST API that persists instrument data for each rock band. It uses a **schema-per-tenant** strategy on a shared PostgreSQL instance: the `dukes` tenant's data lives in the `DUKES` schema, and the `beans` tenant's data lives in the `BEANS` schema. Flyway runs per-tenant migrations independently. Incoming requests are authenticated via JWT, and the tenant is resolved from the `X-TenantId` header injected by the edge service, which selects the correct datasource schema at runtime.
+
+### chat-service (port 8282)
+
+An AI chat service built with Spring AI, Ollama (llama2), and ChromaDB. It implements **per-tenant Retrieval-Augmented Generation (RAG)**: each tenant has an isolated collection in ChromaDB so that queries for one tenant never surface documents from another. The service uses Java 21 virtual threads for efficient concurrent request handling. It can run with a local Ollama installation or use Testcontainers to spin up an Ollama container automatically.
+
+## Technology stack
+
+| Category | Technology |
+|---|---|
+| Language | Java 21 |
+| Framework | Spring Boot 3.2 |
+| API Gateway | Spring Cloud Gateway |
+| Authentication | Keycloak 24, OAuth2 / OIDC |
+| Database | PostgreSQL 16, Flyway (schema-per-tenant) |
+| AI / LLM | Spring AI, Ollama (llama2) |
+| Vector store | ChromaDB 0.4 |
+| Observability | Grafana OSS, Loki, Prometheus, Tempo, Grafana Alloy |
+| Containerization | Docker Compose |
+| Testing | Testcontainers |
+
+## Tenants
+
+| Tenant | Subdomain | DB Schema | Keycloak Realm | Demo User |
+|---|---|---|---|---|
+| dukes | `dukes.rock` | `DUKES` | `dukes` | isabelle / password |
+| beans | `beans.rock` | `BEANS` | `beans` | bjorn / password |
+| trixie | `trixie.rock` | `TRIXIE` | `trixie` | — (disabled) |
+
+## Observability
+
+All three services are instrumented with OpenTelemetry and export traces to Tempo via OTLP (HTTP, port 4318). Logs are shipped to Loki and metrics to Prometheus, all routed through Grafana Alloy. Each log line includes the active `tenantId` in the correlation pattern so tenant context is visible across the full observability stack.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run the full stack locally in minutes with Docker Compose and Gradle.
+  </Card>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    Understand the service topology, request flow, and component responsibilities.
+  </Card>
+  <Card title="Multitenancy Patterns" icon="layer-group" href="/architecture/multitenancy-patterns">
+    Deep dive into subdomain routing, schema-per-tenant databases, and per-tenant RAG.
+  </Card>
+</CardGroup>

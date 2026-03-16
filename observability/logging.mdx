@@ -1,0 +1,176 @@
+---
+title: "Logging"
+description: "Structured log shipping to Grafana Loki with tenant correlation"
+---
+
+Both Spring Boot services ship logs directly to **Grafana Loki** using the `loki4j` Logback appender. Every log line is structured with a correlation pattern that includes the active `traceId`, `spanId`, and `tenantId`, enabling cross-signal navigation from logs to traces in Grafana.
+
+## Dependency
+
+```groovy
+// instrument-service and chat-service build.gradle
+runtimeOnly 'com.github.loki4j:loki-logback-appender:1.5.1'
+```
+
+The `loki-logback-appender` is a pure runtime dependency — no application code changes are required. It registers itself as a Logback appender and batches log entries before sending them to Loki's push API.
+
+## Log Correlation Pattern
+
+Both `instrument-service` and `chat-service` configure the same correlation pattern in `application.yml`:
+
+```yaml
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+```
+
+This pattern is inserted into each log line by Spring Boot's default log format. The `%X{}` directives read values from the SLF4J MDC (Mapped Diagnostic Context). A typical log line looks like:
+
+```
+2024-03-15 12:34:56.789  INFO [instrument-service,abc123def456-789abc] [dukes] c.t.i.InstrumentController : Fetching instruments for tenant
+```
+
+The fields are:
+- `traceId`: the current OpenTelemetry trace ID (auto-populated by Micrometer Tracing)
+- `spanId`: the current span ID
+- `tenantId`: the resolved tenant identifier (populated by `TenantContextFilter`)
+
+## Logback Configuration
+
+The `logback-spring.xml` in `instrument-service` configures the Loki4j appender:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <include resource="org/springframework/boot/logging/logback/base.xml" />
+  <springProperty scope="context" name="appName" source="spring.application.name"/>
+  <springProperty scope="context" name="lokiUri" source="loki.uri"/>
+
+  <appender name="LOKI" class="com.github.loki4j.logback.Loki4jAppender">
+    <batchTimeoutMs>2000</batchTimeoutMs>
+    <http>
+      <url>${lokiUri:-http://localhost:3100/loki/api/v1/push}</url>
+    </http>
+    <format>
+      <label>
+        <pattern>application=${appName},hostname=${HOSTNAME},level=%level</pattern>
+      </label>
+      <message>
+        <pattern>${FILE_LOG_PATTERN}</pattern>
+      </message>
+      <sortByTime>true</sortByTime>
+    </format>
+  </appender>
+
+  <root level="INFO">
+    <appender-ref ref="LOKI"/>
+  </root>
+</configuration>
+```
+
+Key points:
+
+- The Loki endpoint URL is read from the `loki.uri` Spring property, with `http://localhost:3100/loki/api/v1/push` as the default. This means the same config works for local development and Docker deployments (where `loki.uri` can be overridden in `application.yml` or via environment variable).
+- **Labels** index the log stream: `application` (from `spring.application.name`), `hostname` (from the `HOSTNAME` environment variable), and `level` (from the Logback log level). These are low-cardinality values stored as Loki stream labels.
+- **Message** uses `${FILE_LOG_PATTERN}`, which is the default Spring Boot file log pattern and includes the correlation pattern defined in `application.yml`. This means the full `[traceId-spanId] [tenantId]` context is embedded in the log message body.
+- `batchTimeoutMs: 2000` batches log entries for up to 2 seconds before flushing, reducing HTTP overhead.
+- `sortByTime: true` ensures entries within a batch are ordered by timestamp, which Loki requires.
+
+## Tenant ID in MDC
+
+The `TenantContextFilter` populates the MDC before the request is processed and clears it unconditionally in the `finally` block:
+
+```java
+@Override
+protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+        FilterChain filterChain) throws ServletException, IOException {
+    var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+    if (StringUtils.hasText(tenantIdentifier) && isTenantValid(tenantIdentifier)) {
+        TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+        configureLogs(tenantIdentifier);    // MDC.put("tenantId", tenantId)
+        configureTraces(tenantIdentifier, request);
+    } else {
+        throw new TenantResolutionException(...);
+    }
+
+    try {
+        filterChain.doFilter(request, response);
+    } finally {
+        clear();    // MDC.remove("tenantId")
+    }
+}
+
+private void configureLogs(String tenantId) {
+    MDC.put("tenantId", tenantId);
+}
+
+private void clear() {
+    MDC.remove("tenantId");
+    TenantContextHolder.clear();
+}
+```
+
+Because `tenantId` is set before `filterChain.doFilter()`, every log statement made anywhere downstream — including inside service classes, repositories, and framework code — will automatically include the correct tenant in its MDC context.
+
+<Note>
+`chat-service` enables virtual threads (`spring.threads.virtual.enabled: true`). SLF4J MDC values are **not** automatically propagated to child virtual threads or `CompletableFuture` callbacks. If your code spawns additional threads within a request, you must manually propagate the MDC context using `MDC.getCopyOfContextMap()` and restore it on the new thread.
+</Note>
+
+## Loki Storage and Labels
+
+Loki in this project is configured for single-node filesystem storage (`loki.yml`):
+
+```yaml
+common:
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+```
+
+Grafana Alloy also ships **Docker container logs** to Loki using the Docker discovery integration, labelling them with `application` (from the container name) and `version` (from the OCI image version label). This means platform-level container logs (Tempo, Prometheus, Keycloak, etc.) are also available in Loki alongside the application logs pushed by Loki4j.
+
+## Querying Logs in Grafana
+
+Open Grafana at [http://localhost:3000](http://localhost:3000) and navigate to **Explore**, then select the **Loki** datasource.
+
+**Filter logs for a specific tenant:**
+
+```logql
+{application="instrument-service"} |= "dukes"
+```
+
+**Filter by tenant using the structured message field:**
+
+```logql
+{application="instrument-service"} | pattern `<_> [<_>] [<tenant>] <_>` | tenant = `dukes`
+```
+
+**Filter logs for a specific trace ID:**
+
+```logql
+{application="instrument-service"} |= "abc123def456"
+```
+
+**Show only ERROR logs across all services:**
+
+```logql
+{level="ERROR"}
+```
+
+## Logs → Traces Link
+
+The Loki datasource in Grafana is configured with a derived field that extracts the trace ID from each log line and links it to the Tempo datasource:
+
+```yaml
+jsonData:
+  derivedFields:
+    - datasourceUid: tempo
+      matcherRegex: '.+ --- \[.+\] \[.+\] \[(\w*)-\w*\] .+'
+      name: traceId
+      url: ${__value.raw}
+```
+
+When viewing logs in the Grafana Explore panel, a **Tempo** link appears next to each log line that contains a trace ID. Clicking it opens the full trace waterfall for that request.

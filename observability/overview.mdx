@@ -1,0 +1,70 @@
+---
+title: "Observability Overview"
+description: "Full-stack observability with Grafana, Loki, Tempo, and Prometheus"
+---
+
+The sample project ships a complete observability stack built on the Grafana LGTM suite (Loki, Grafana, Tempo, Mimir/Prometheus). Every Spring Boot service emits the three pillars of observability — **metrics**, **traces**, and **logs** — and each signal is enriched with a `tenantId` so you can filter and correlate data per tenant at query time.
+
+## Components
+
+| Component | Port(s) | Purpose |
+|---|---|---|
+| **Grafana Alloy** | 4317 (gRPC OTLP), 4318 (HTTP OTLP), 12345 (admin) | Central collector: receives OTLP traces, scrapes Prometheus metrics, ships Docker container logs to Loki |
+| **Grafana Tempo** | 3100 | Distributed tracing backend; ingests OTLP, Jaeger, and Zipkin; generates service-graph and span-metrics |
+| **Prometheus** | 9090 | Metrics storage; receives remote-write from Alloy and from Tempo's metrics generator |
+| **Grafana Loki** | 3100 | Log aggregation backend; indexed by `application`, `hostname`, and `level` labels |
+| **Grafana** | 3000 | Unified dashboards; pre-configured datasources and pre-built dashboards |
+
+## The Three Pillars
+
+### Metrics
+
+Each service exposes a Prometheus-format scrape endpoint at `/actuator/prometheus` via the `micrometer-registry-prometheus` runtime dependency. Grafana Alloy scrapes these endpoints every 5 seconds and remote-writes the data to Prometheus. Tempo's metrics generator additionally produces `service-graphs` and `span-metrics` from ingested trace data and remote-writes those to Prometheus as well.
+
+Pre-built Grafana dashboards cover JVM internals, HTTP request rates and latencies, JDBC connection-pool health, and Prometheus self-monitoring.
+
+### Traces
+
+Services use `micrometer-tracing-bridge-otel` with `opentelemetry-exporter-otlp` to export trace spans to Grafana Alloy over HTTP OTLP (`http://localhost:4318/v1/traces`). Alloy forwards spans through a memory-limiter and batch processor to Grafana Tempo. Sampling is set to 100% (`probability: 1.0`) so every request is traced during development.
+
+### Logs
+
+Services use the `loki-logback-appender` (`loki4j`) to push structured log lines directly to Loki at `http://localhost:3100/loki/api/v1/push`. The log format includes the Spring Boot correlation pattern so every line carries the active `traceId`, `spanId`, and `tenantId`.
+
+## Tenant Correlation Across All Three Pillars
+
+The `TenantContextFilter` servlet filter runs on every non-actuator request and enriches all three signals with the resolved tenant identity:
+
+| Signal | Mechanism | Key |
+|---|---|---|
+| Logs | `MDC.put("tenantId", tenantId)` | `tenantId` in the log pattern |
+| Traces | `context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId))` via Micrometer `ServerHttpObservationFilter` | `tenant.id` span attribute |
+| Metrics | Micrometer common tags: `application` label on every metric | correlate via `application` tag |
+
+The MDC value is always cleared in a `finally` block, preventing leakage between requests.
+
+## Grafana Datasource Links
+
+The three Grafana datasources are wired together for seamless cross-signal navigation:
+
+- **Traces → Logs**: The Tempo datasource is configured with `tracesToLogs`, mapping the `service.name` span attribute to the `application` Loki label and enabling `filterByTraceID`. Clicking a trace in Grafana opens the correlated Loki log stream filtered to that exact trace ID.
+- **Traces → Metrics**: The Tempo datasource includes `tracesToMetrics` queries for throughput (`http_server_requests_seconds_count`) and latency (`http_server_requests_seconds_bucket`), scoped by the same HTTP tags (`method`, `uri`, `status`, `outcome`).
+- **Metrics → Traces**: The Prometheus datasource has `exemplarTraceIdDestinations` pointing to the Tempo datasource, so histogram exemplars link directly to the trace that produced them.
+- **Logs → Traces**: The Loki datasource has a `derivedFields` rule that extracts the `traceId` from the log pattern and links it to Tempo.
+
+## Navigation
+
+<CardGroup cols={2}>
+  <Card title="Distributed Tracing" icon="timeline" href="/observability/tracing">
+    OpenTelemetry tracing via Grafana Alloy and Tempo
+  </Card>
+  <Card title="Metrics" icon="chart-line" href="/observability/metrics">
+    Prometheus metrics with Micrometer and Grafana dashboards
+  </Card>
+  <Card title="Logging" icon="file-lines" href="/observability/logging">
+    Structured log shipping to Grafana Loki with tenant correlation
+  </Card>
+  <Card title="Grafana" icon="chart-bar" href="/platform/grafana">
+    Dashboard configuration and pre-built dashboards
+  </Card>
+</CardGroup>

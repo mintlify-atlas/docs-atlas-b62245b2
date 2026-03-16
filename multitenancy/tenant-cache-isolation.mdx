@@ -1,0 +1,119 @@
+---
+title: "Tenant Cache Isolation"
+description: "How instrument-service uses a tenant-aware key generator to prevent Spring Cache from mixing cached data across tenant boundaries."
+---
+
+Spring's `@Cacheable` annotation generates cache keys from the method parameters by default. In a multitenant application this is dangerous: two tenants calling `getInstrumentByType("guitar")` would share the same cache key, and the first tenant's data would be served to the second.
+
+`TenantKeyGenerator` solves this by prepending the current tenant identifier to every cache key.
+
+<Warning>
+  Using default cache key generation (or any tenant-unaware `KeyGenerator`) in a multitenant app will cause data from one tenant to be returned to another. Always use `TenantKeyGenerator` — or an equivalent tenant-prefixed strategy — for any `@Cacheable` method.
+</Warning>
+
+## `TenantKeyGenerator`
+
+`TenantKeyGenerator` implements Spring's `KeyGenerator` interface. It delegates key construction to `SimpleKeyGenerator` but includes the current tenant identifier as the first element:
+
+```java TenantKeyGenerator.java
+/**
+ * An implementation of {@link KeyGenerator} that generates cache keys combining
+ * the current tenant identifier with the given method and parameters.
+ */
+@Component
+public final class TenantKeyGenerator implements KeyGenerator {
+
+    @Override
+    public Object generate(Object target, Method method, Object... params) {
+        return SimpleKeyGenerator.generateKey(
+            TenantContextHolder.getRequiredTenantIdentifier(), params);
+    }
+
+}
+```
+
+`SimpleKeyGenerator.generateKey` takes a varargs array. Passing the tenant identifier as the first argument and `params` (the original method parameters) as the second produces a composite `SimpleKey` of the form `[tenantId, param1, param2, ...]`.
+
+For example, a call to `getInstrumentByType("guitar")` from the `dukes` tenant produces the cache key `[dukes, guitar]`, while the same call from `beans` produces `[beans, guitar]`. These are distinct entries in the cache — no cross-tenant leakage.
+
+## Enabling caching
+
+`@EnableCaching` is declared on the main application class:
+
+```java InstrumentServiceApplication.java
+@SpringBootApplication
+@ConfigurationPropertiesScan
+@EnableCaching
+public class InstrumentServiceApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(InstrumentServiceApplication.class, args);
+    }
+
+}
+```
+
+## Using `TenantKeyGenerator` in a controller
+
+The `InstrumentController.getInstrumentByType` method uses `@Cacheable` with the `tenantKeyGenerator` bean:
+
+```java InstrumentController.java
+@RestController
+@RequestMapping("instruments")
+public class InstrumentController {
+
+    private final InstrumentRepository instrumentRepository;
+
+    InstrumentController(InstrumentRepository instrumentRepository) {
+        this.instrumentRepository = instrumentRepository;
+    }
+
+    @GetMapping
+    List<Instrument> getInstruments() {
+        log.info("Returning all instruments");
+        return instrumentRepository.findAll();
+    }
+
+    @GetMapping("{type}")
+    @Cacheable(cacheNames = "instrumentTypes", keyGenerator = "tenantKeyGenerator")
+    List<Instrument> getInstrumentByType(@PathVariable String type) {
+        log.info("Returning instrument of type: {}", type);
+        return instrumentRepository.findByType(type);
+    }
+
+    @PostMapping
+    Instrument addInstrument(@RequestBody Instrument instrument) {
+        log.info("Adding instrument: {}", instrument.getName());
+        return instrumentRepository.save(instrument);
+    }
+
+}
+```
+
+The `keyGenerator = "tenantKeyGenerator"` attribute references the `TenantKeyGenerator` bean by its Spring bean name (derived from the class name by `@Component`).
+
+## Cache key format
+
+For a call to `GET /instruments/guitar` from the `dukes` tenant, the resulting cache key is:
+
+```
+Cache name : instrumentTypes
+Cache key  : SimpleKey [dukes, guitar]
+```
+
+The same call from the `beans` tenant produces:
+
+```
+Cache name : instrumentTypes
+Cache key  : SimpleKey [beans, guitar]
+```
+
+Both entries coexist in the `instrumentTypes` cache without interference.
+
+<Note>
+  The `getInstruments()` endpoint that returns all instruments is **not** cached. Caching a list that is scoped only by tenant (no additional key discriminator) would require explicit cache eviction on every write — a straightforward extension but not implemented in this sample.
+</Note>
+
+<Tip>
+  Apply `TenantKeyGenerator` to any additional `@Cacheable` method that you add. The pattern extends directly: specify `keyGenerator = "tenantKeyGenerator"` on the annotation, and the tenant prefix is handled automatically. No changes to the generator itself are needed.
+</Tip>

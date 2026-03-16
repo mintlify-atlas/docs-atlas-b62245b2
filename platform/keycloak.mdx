@@ -1,0 +1,163 @@
+---
+title: "Keycloak"
+description: "Per-tenant identity provider with separate realms for each tenant"
+---
+
+Keycloak 24.0 provides OAuth2/OIDC authentication for the multitenancy sample. Each tenant maps to its own isolated Keycloak realm, so tokens issued for one tenant are completely separate from another. The `edge-service` Spring Cloud Gateway handles OIDC login and token relay on behalf of all tenants.
+
+## Tenant → Realm mapping
+
+Each active tenant has a corresponding Keycloak realm. The `edge-service` reads tenant configuration from `application.yml` and resolves the issuer URL per tenant:
+
+| Tenant | Realm | Issuer URL | Status |
+|--------|-------|-----------|--------|
+| `dukes` | `dukes` | `http://localhost:8080/realms/dukes` | Enabled |
+| `beans` | `beans` | `http://localhost:8080/realms/beans` | Enabled |
+| `trixie` | `trixie` | `http://localhost:8080/realms/trixie` | Disabled |
+
+<Note>
+The `trixie` tenant is configured in `application.yml` but has `enabled: false`. Keycloak does not have a `trixie` realm. Any request routed through the `trixie` subdomain will be rejected by `edge-service` before reaching Keycloak.
+</Note>
+
+The tenant configuration in `edge-service/src/main/resources/application.yml`:
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/trixie
+```
+
+## Realm configuration
+
+Both the `dukes` and `beans` realms are configured identically. Each realm contains:
+
+### Users
+
+| Realm | Username | Password |
+|-------|----------|----------|
+| `dukes` | `isabelle` | `password` |
+| `beans` | `bjorn` | `password` |
+
+### `edge-service` client
+
+Each realm has a single confidential OIDC client registered for `edge-service`:
+
+| Setting | Value |
+|---------|-------|
+| Client ID | `edge-service` |
+| Client secret | `rocking-secret` |
+| Access type | Confidential |
+| Standard flow | Enabled (Authorization Code) |
+| Direct access grants | Enabled (Resource Owner Password) |
+| Redirect URIs | `*` (wildcard) |
+| Post-logout redirect URIs | `*` (wildcard) |
+| Front-channel logout | Enabled |
+
+The client configuration from `platform/keycloak/realm-config.json`:
+
+```json
+{
+  "clientId": "edge-service",
+  "clientAuthenticatorType": "client-secret",
+  "secret": "rocking-secret",
+  "redirectUris": ["*"],
+  "standardFlowEnabled": true,
+  "directAccessGrantsEnabled": true,
+  "publicClient": false,
+  "frontchannelLogout": true
+}
+```
+
+## How realms are imported
+
+Keycloak loads realm definitions automatically at startup via its `--import-realm` flag. Docker Compose mounts the `platform/keycloak/` directory into the container at `/opt/keycloak/data/import`:
+
+```yaml
+keycloak:
+  image: quay.io/keycloak/keycloak:24.0
+  command: start-dev --import-realm --metrics-enabled=true
+  volumes:
+    - ./platform/keycloak:/opt/keycloak/data/import
+  environment:
+    - KEYCLOAK_ADMIN=user
+    - KEYCLOAK_ADMIN_PASSWORD=password
+  ports:
+    - 8080:8080
+```
+
+The file `platform/keycloak/realm-config.json` is a JSON array containing both realm definitions (`beans` and `dukes`). Keycloak iterates over the array and imports each realm on first startup. If the realm already exists, the import is skipped.
+
+## Accessing Keycloak
+
+The admin console is available at **[http://localhost:8080](http://localhost:8080)**.
+
+| Credential | Value |
+|------------|-------|
+| Username | `user` |
+| Password | `password` |
+
+Navigate to a realm by selecting it from the realm dropdown in the top-left corner of the admin console. You can inspect users, clients, and tokens directly from the UI.
+
+## Adding a new tenant realm
+
+<Steps>
+  <Step title="Create the realm JSON definition">
+    Add a new realm object to `platform/keycloak/realm-config.json`. Copy the structure of the existing `beans` or `dukes` realm and update:
+    - `"realm"` — set to the new tenant identifier (e.g., `"rockets"`)
+    - `"users"` — add a user with a hashed password, or create them manually after import
+    - `"clients"` — keep the `edge-service` client entry with `"secret": "rocking-secret"`
+  </Step>
+
+  <Step title="Register the tenant in edge-service">
+    Add the new tenant to `edge-service/src/main/resources/application.yml`:
+
+    ```yaml
+    multitenancy:
+      tenants:
+        - identifier: rockets
+          enabled: true
+          client-id: edge-service
+          client-secret: rocking-secret
+          issuer: http://localhost:8080/realms/rockets
+    ```
+  </Step>
+
+  <Step title="Restart Keycloak">
+    Bring Keycloak down and back up so it re-imports from the updated `realm-config.json`:
+
+    ```bash
+    docker compose restart keycloak
+    ```
+
+    On first import Keycloak creates the realm; subsequent restarts skip it if the realm already exists.
+  </Step>
+
+  <Step title="Verify the realm">
+    Open the admin console at `http://localhost:8080`, switch to your new realm, and confirm the `edge-service` client and user are present. Test token issuance:
+
+    ```bash
+    curl -s -X POST \
+      http://localhost:8080/realms/rockets/protocol/openid-connect/token \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      -d 'grant_type=password' \
+      -d 'client_id=edge-service' \
+      -d 'client_secret=rocking-secret' \
+      -d 'username=<user>' \
+      -d 'password=password'
+    ```
+  </Step>
+</Steps>
