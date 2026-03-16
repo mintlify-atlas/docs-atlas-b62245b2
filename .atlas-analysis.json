@@ -1,0 +1,95 @@
+{
+  "projectType": "general",
+  "projectName": "Spring Boot Multitenancy",
+  "projectDescription": "Sample project demonstrating how to build multitenant applications with Java 21 and Spring Boot 3.2, featuring schema-per-tenant databases, per-tenant OAuth2/OIDC authentication, and tenant-isolated vector store queries.",
+  "theme": "linden",
+  "primaryColor": "#535353",
+  "lightColor": "#1a1a1a",
+  "darkColor": "#c9c9c9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/multitenancy-patterns",
+              "architecture/request-flow"
+            ]
+          },
+          {
+            "group": "Services",
+            "pages": [
+              "services/edge-service",
+              "services/instrument-service",
+              "services/chat-service"
+            ]
+          },
+          {
+            "group": "Multitenancy",
+            "pages": [
+              "multitenancy/tenant-resolution",
+              "multitenancy/tenant-context",
+              "multitenancy/schema-per-tenant",
+              "multitenancy/per-tenant-auth",
+              "multitenancy/tenant-cache-isolation",
+              "multitenancy/vector-store-filtering"
+            ]
+          },
+          {
+            "group": "Observability",
+            "pages": [
+              "observability/overview",
+              "observability/tracing",
+              "observability/metrics",
+              "observability/logging"
+            ]
+          },
+          {
+            "group": "Platform",
+            "pages": [
+              "platform/keycloak",
+              "platform/docker-compose",
+              "platform/grafana"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Schema-per-tenant PostgreSQL isolation using Hibernate MultiTenantConnectionProvider",
+    "Per-tenant OAuth2/OIDC authentication via dynamic Keycloak realm selection",
+    "Subdomain-based tenant routing with Spring Cloud Gateway",
+    "Tenant-isolated vector store queries in ChromaDB using metadata filtering",
+    "Automatic per-tenant Flyway database migrations",
+    "Tenant-aware cache key generation to prevent cross-tenant data leakage",
+    "Tenant ID propagated to MDC (logs) and Micrometer traces for full observability",
+    "RAG (Retrieval-Augmented Generation) with per-tenant document isolation using Spring AI"
+  ],
+  "publicApiSurface": [
+    "GET /instruments — List all instruments for the current tenant",
+    "GET /instruments/{type} — List instruments by type (cached per tenant)",
+    "POST /instruments — Create a new instrument in the current tenant's schema",
+    "POST /ai/simple/chat — Send a plain message to the LLM (Ollama/llama2)",
+    "POST /ai/doc/chat — Send a message with RAG using tenant-filtered ChromaDB documents",
+    "TenantContextHolder — Thread-local store for current tenant identifier",
+    "TenantDetailsService — Interface for loading tenant configuration",
+    "TenantContextFilter — OncePerRequestFilter that resolves and sets tenant context",
+    "TenantAuthenticationManagerResolver — Per-tenant JWT validation against correct Keycloak realm",
+    "TenantClientRegistrationRepository — Reactive per-tenant OAuth2 OIDC client registration",
+    "ConnectionProvider (Hibernate) — Schema-switching MultiTenantConnectionProvider",
+    "TenantIdentifierResolver (Hibernate) — CurrentTenantIdentifierResolver backed by TenantContextHolder",
+    "TenantFlywayMigrationInitializer — Runs Flyway migrations per tenant schema",
+    "TenantKeyGenerator — Cache key generator prefixed with tenant ID"
+  ]
+}
